@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kellner — Voice Assistant</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0d0d0d;
+      color: #e5e5e5;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      overflow: hidden;
+    }
+
+    header {
+      width: 100%;
+      padding: 1.25rem 2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #1f1f1f;
+    }
+
+    .brand { font-size: 1.1rem; font-weight: 700; letter-spacing: 0.12em; color: #fff; }
+    .conn-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #ef4444; transition: background 0.3s;
+    }
+    .conn-dot.connected { background: #22c55e; }
+
+    .conversation {
+      flex: 1;
+      width: 100%;
+      max-width: 680px;
+      overflow-y: auto;
+      padding: 1.5rem 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      scroll-behavior: smooth;
+    }
+
+    .bubble {
+      max-width: 78%;
+      padding: 0.7rem 1rem;
+      border-radius: 1.25rem;
+      font-size: 0.93rem;
+      line-height: 1.55;
+      animation: pop 0.2s ease;
+    }
+    .bubble.user {
+      align-self: flex-end;
+      background: #1d4ed8;
+      color: #fff;
+      border-bottom-right-radius: 0.3rem;
+    }
+    .bubble.assistant {
+      align-self: flex-start;
+      background: #1a1a1a;
+      color: #e5e5e5;
+      border: 1px solid #2a2a2a;
+      border-bottom-left-radius: 0.3rem;
+    }
+    .bubble.typing {
+      color: #666;
+      font-style: italic;
+      background: transparent;
+      border: none;
+      padding-left: 0;
+    }
+
+    @keyframes pop {
+      from { opacity: 0; transform: scale(0.96) translateY(6px); }
+      to   { opacity: 1; transform: scale(1) translateY(0); }
+    }
+
+    .controls {
+      padding: 1.5rem 2rem 2rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
+    }
+
+    .start-btn {
+      padding: 0.65rem 1.4rem;
+      border-radius: 999px;
+      border: none;
+      background: #1d4ed8;
+      color: #fff;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s, transform 0.15s;
+    }
+    .start-btn:hover:not(:disabled) { background: #2563eb; transform: scale(1.02); }
+    .start-btn:disabled { opacity: 0.45; cursor: default; }
+
+    .live-pill {
+      display: none;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.82rem;
+      color: #22c55e;
+      letter-spacing: 0.06em;
+    }
+    .live-pill.on { display: flex; }
+    .live-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #22c55e;
+      animation: pulse 1.2s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.5; transform: scale(1.15); }
+    }
+
+    .status {
+      font-size: 0.82rem;
+      color: #555;
+      letter-spacing: 0.04em;
+      min-height: 1.2rem;
+      text-align: center;
+      max-width: 320px;
+      transition: color 0.2s;
+    }
+    .status.active { color: #60a5fa; }
+  </style>
+</head>
+<body>
+
+<header>
+  <span class="brand">KELLNER</span>
+  <div class="conn-dot" id="connDot"></div>
+</header>
+
+<div class="conversation" id="conv"></div>
+
+<div class="controls">
+  <button class="start-btn" id="startBtn" disabled>Start voice chat</button>
+  <div class="live-pill" id="livePill"><span class="live-dot"></span> Listening</div>
+  <span class="status" id="status">Connecting…</span>
+</div>
+
+<script>
+  const WS_URL = `ws://${location.host}/api/ws/conversation`;
+
+  let ws;
+  let audioCtx;
+  let recorderStream, recorderNode;
+  let voiceActive = false;
+
+  let playbackTurnId = null;
+  let assistantSpeaking = false;
+  let assistantBubble = null;
+  let nextPlayTime = 0;
+  const activeSources = [];
+  /** Ignore mic-based barge-in until this time (ms) — stops speaker bleed killing TTS instantly */
+  let bargeInAllowedAfter = 0;
+
+  const BARGE_RMS = 0.14;
+
+  function playbackMatchesTurn(msg, allowBootstrap) {
+    const t = Number(msg.turn_id);
+    if (Number.isNaN(t)) return false;
+    if (playbackTurnId === null && allowBootstrap) {
+      playbackTurnId = t;
+      return true;
+    }
+    return Number(playbackTurnId) === t;
+  }
+
+  function connect() {
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+      document.getElementById('connDot').classList.add('connected');
+      document.getElementById('startBtn').disabled = false;
+      setStatus('Tap “Start voice chat” to begin', false);
+    };
+
+    ws.onclose = () => {
+      document.getElementById('connDot').classList.remove('connected');
+      document.getElementById('startBtn').disabled = true;
+      stopVoiceCapture();
+      setStatus('Disconnected — reconnecting…', false);
+      setTimeout(connect, 2500);
+    };
+
+    ws.onerror = () => setStatus('Connection error', false);
+
+    ws.onmessage = async (ev) => {
+      if (typeof ev.data !== 'string') return;
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      try {
+      if (msg.type === 'transcript_partial') {
+        setStatus('Heard: ' + (msg.text || '…'), true);
+      } else if (msg.type === 'transcript') {
+        playbackTurnId = Number(msg.turn_id);
+        addBubble(msg.text, 'user');
+        assistantBubble = addBubble('…', 'assistant typing');
+        setStatus('Thinking…', true);
+        assistantSpeaking = false;
+      } else if (msg.type === 'assistant_text_delta') {
+        if (!playbackMatchesTurn(msg, false)) return;
+        if (assistantBubble) {
+          assistantBubble.classList.remove('typing');
+          const cur = assistantBubble.textContent === '…' ? '' : assistantBubble.textContent + ' ';
+          assistantBubble.textContent = cur + msg.text;
+        }
+        setStatus('Speaking…', true);
+      } else if (msg.type === 'audio_delta') {
+        if (!playbackMatchesTurn(msg, true)) return;
+        assistantSpeaking = true;
+        bargeInAllowedAfter = performance.now() + 1400;
+        await playPcmB64(msg.b64, Number(msg.turn_id));
+      } else if (msg.type === 'done') {
+        assistantSpeaking = false;
+        assistantBubble = null;
+        if (!activeSources.length) setStatus('Listening…', true);
+      } else if (msg.type === 'interrupted') {
+        stopAllPlayback();
+        assistantSpeaking = false;
+        assistantBubble = null;
+        setStatus('Listening…', true);
+      } else if (msg.type === 'error') {
+        if (assistantBubble) { assistantBubble.remove(); assistantBubble = null; }
+        setStatus(msg.message || 'Error', false);
+      }
+      } catch (err) {
+        console.error('ws message handler', err);
+        setStatus('Playback error — check console', false);
+      }
+    };
+  }
+
+  function stopAllPlayback() {
+    activeSources.forEach(s => {
+      try { s.stop(); } catch (_) {}
+    });
+    activeSources.length = 0;
+    if (audioCtx) nextPlayTime = audioCtx.currentTime;
+  }
+
+  function sendInterrupt() {
+    stopAllPlayback();
+    assistantSpeaking = false;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'interrupt' }));
+    }
+  }
+
+  async function playPcmB64(b64, turnId) {
+    if (Number(turnId) !== Number(playbackTurnId)) return;
+    if (!b64 || !b64.length) return;
+    if (!audioCtx) audioCtx = new AudioContext();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    const bin = atob(b64);
+    const u8 = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    const nSamp = Math.floor(u8.length / 2);
+    if (nSamp < 1) return;
+    const dv = new DataView(u8.buffer, u8.byteOffset, nSamp * 2);
+    const f32 = new Float32Array(nSamp);
+    for (let i = 0; i < nSamp; i++) f32[i] = dv.getInt16(i * 2, true) / 32768;
+
+    const buffer = audioCtx.createBuffer(1, f32.length, 16000);
+    buffer.copyToChannel(f32, 0);
+    const src = audioCtx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(audioCtx.destination);
+
+    const now = audioCtx.currentTime;
+    if (nextPlayTime < now) nextPlayTime = now;
+    activeSources.push(src);
+    src.onended = () => {
+      const i = activeSources.indexOf(src);
+      if (i >= 0) activeSources.splice(i, 1);
+    };
+    src.start(nextPlayTime);
+    nextPlayTime += buffer.duration;
+  }
+
+  function downsampleTo16k(samples, fromRate) {
+    if (fromRate === 16000) return samples;
+    const ratio = fromRate / 16000;
+    const out = new Float32Array(Math.floor(samples.length / ratio));
+    for (let i = 0; i < out.length; i++) out[i] = samples[Math.floor(i * ratio)];
+    return out;
+  }
+
+  function floatTo16BitPCM(float32Array) {
+    const buf = new ArrayBuffer(float32Array.length * 2);
+    const view = new DataView(buf);
+    for (let i = 0; i < float32Array.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32Array[i]));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return new Uint8Array(buf);
+  }
+
+  async function startVoiceChat() {
+    if (!ws || ws.readyState !== WebSocket.OPEN || voiceActive) return;
+    try {
+      recorderStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 }
+      });
+      if (!audioCtx) audioCtx = new AudioContext();
+      await audioCtx.resume();
+
+      ws.send(JSON.stringify({ type: 'voice_session' }));
+
+      const source = audioCtx.createMediaStreamSource(recorderStream);
+      recorderNode = audioCtx.createScriptProcessor(4096, 1, 1);
+      const fromRate = audioCtx.sampleRate;
+
+      recorderNode.onaudioprocess = e => {
+        if (!voiceActive || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const f32 = e.inputBuffer.getChannelData(0);
+        let sum = 0;
+        for (let i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
+        const rms = Math.sqrt(sum / f32.length);
+        if (assistantSpeaking && performance.now() >= bargeInAllowedAfter && rms > BARGE_RMS) {
+          sendInterrupt();
+        }
+
+        const down = downsampleTo16k(f32, fromRate);
+        const pcm = floatTo16BitPCM(down);
+        ws.send(pcm.buffer);
+      };
+
+      source.connect(recorderNode);
+      const silentOut = audioCtx.createGain();
+      silentOut.gain.value = 0;
+      recorderNode.connect(silentOut);
+      silentOut.connect(audioCtx.destination);
+
+      voiceActive = true;
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('livePill').classList.add('on');
+      setStatus('Listening… speak naturally', true);
+    } catch {
+      setStatus('Microphone access denied', false);
+    }
+  }
+
+  function stopVoiceCapture() {
+    voiceActive = false;
+    document.getElementById('livePill').classList.remove('on');
+    try {
+      if (recorderNode) recorderNode.disconnect();
+      if (recorderStream) recorderStream.getTracks().forEach(t => t.stop());
+    } catch (_) {}
+    recorderNode = null;
+    recorderStream = null;
+  }
+
+  function addBubble(text, cls) {
+    const conv = document.getElementById('conv');
+    const div = document.createElement('div');
+    div.className = `bubble ${cls}`;
+    div.textContent = text;
+    conv.appendChild(div);
+    conv.scrollTop = conv.scrollHeight;
+    return div;
+  }
+
+  function setStatus(text, active) {
+    const el = document.getElementById('status');
+    el.textContent = text;
+    el.className = `status${active ? ' active' : ''}`;
+  }
+
+  document.getElementById('startBtn').addEventListener('click', startVoiceChat);
+
+  connect();
+</script>
+</body>
+</html>
