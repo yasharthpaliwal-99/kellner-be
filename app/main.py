@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -5,8 +6,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from app.api.conversation import router as conversation_router
+from app.api.kitchen import router as kitchen_router
+from app.db.mongo import ensure_order_indexes
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ensure_order_indexes()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,6 +26,7 @@ app.add_middleware(
 )
 
 app.include_router(conversation_router, prefix="/api")
+app.include_router(kitchen_router, prefix="/api")
 
 
 @app.get("/", response_class=HTMLResponse)

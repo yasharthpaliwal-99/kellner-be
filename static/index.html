@@ -34,16 +34,97 @@
     }
     .conn-dot.connected { background: #22c55e; }
 
-    .conversation {
+    .stage {
       flex: 1;
       width: 100%;
-      max-width: 680px;
+      max-width: 1100px;
+      margin: 0 auto;
+      display: flex;
+      gap: 1rem;
+      padding: 0 1rem;
+      min-height: 0;
+      align-items: stretch;
+    }
+
+    @media (max-width: 720px) {
+      .stage { flex-direction: column; }
+      .rec-panel { width: 100% !important; max-height: 38dvh; }
+    }
+
+    .conversation {
+      flex: 1;
+      min-width: 0;
       overflow-y: auto;
-      padding: 1.5rem 1rem;
+      padding: 1.5rem 0;
       display: flex;
       flex-direction: column;
       gap: 0.75rem;
       scroll-behavior: smooth;
+    }
+
+    .rec-panel {
+      width: min(320px, 100%);
+      flex-shrink: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      padding: 1rem 0;
+    }
+
+    .rec-panel[hidden] {
+      display: none !important;
+    }
+
+    .rec-panel-label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: #737373;
+    }
+
+    .rec-cards {
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+      overflow-y: auto;
+      max-height: calc(100dvh - 220px);
+    }
+
+    .rec-card {
+      background: #f5f5f5;
+      color: #0a0a0a;
+      border: 2px solid #0a0a0a;
+      border-radius: 14px;
+      padding: 0.75rem 0.9rem;
+      font-size: 0.88rem;
+      line-height: 1.45;
+    }
+
+    .rec-card-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 0.5rem;
+      margin-bottom: 0.4rem;
+    }
+
+    .rec-name {
+      font-weight: 700;
+      flex: 1;
+      min-width: 0;
+    }
+
+    .rec-price {
+      font-weight: 600;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      color: #171717;
+    }
+
+    .rec-info {
+      font-size: 0.8rem;
+      color: #404040;
     }
 
     .bubble {
@@ -132,6 +213,17 @@
       transition: color 0.2s;
     }
     .status.active { color: #60a5fa; }
+
+    .latency {
+      font-size: 0.72rem;
+      font-family: ui-monospace, monospace;
+      color: #6b7280;
+      text-align: center;
+      max-width: 420px;
+      line-height: 1.45;
+      min-height: 2.2rem;
+    }
+    .latency.has-data { color: #a3e635; }
   </style>
 </head>
 <body>
@@ -141,16 +233,24 @@
   <div class="conn-dot" id="connDot"></div>
 </header>
 
-<div class="conversation" id="conv"></div>
+<div class="stage">
+  <div class="conversation" id="conv"></div>
+  <aside class="rec-panel" id="recPanel" hidden>
+    <div class="rec-panel-label">Suggestions</div>
+    <div class="rec-cards" id="recCards"></div>
+  </aside>
+</div>
 
 <div class="controls">
   <button class="start-btn" id="startBtn" disabled>Start voice chat</button>
   <div class="live-pill" id="livePill"><span class="live-dot"></span> Listening</div>
   <span class="status" id="status">Connecting…</span>
+  <div class="latency" id="latency" title="From final transcript to first token on wire">Latency — speak a phrase, then check after reply</div>
 </div>
 
 <script>
-  const WS_URL = `ws://${location.host}/api/ws/conversation`;
+  const WS_PROTO = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const WS_URL = `${WS_PROTO}//${location.host}/api/ws/conversation`;
 
   let ws;
   let audioCtx;
@@ -165,7 +265,78 @@
   /** Ignore mic-based barge-in until this time (ms) — stops speaker bleed killing TTS instantly */
   let bargeInAllowedAfter = 0;
 
+  /** End-to-end latency (browser clock): final transcript → first UI / first audio chunk */
+  let latTurnStart = null;
+  let latGotFirstText = false;
+  let latGotFirstAudio = false;
+  let latFirstTextMs = null;
+  let latFirstAudioMs = null;
+
   const BARGE_RMS = 0.14;
+
+  function clearRecommendations() {
+    const panel = document.getElementById('recPanel');
+    const cards = document.getElementById('recCards');
+    if (cards) cards.innerHTML = '';
+    if (panel) panel.hidden = true;
+  }
+
+  function formatRecPrice(p) {
+    if (p == null || p === '') return '—';
+    const n = Number(p);
+    if (Number.isNaN(n)) return '—';
+    return n.toFixed(2);
+  }
+
+  function renderRecommendations(items) {
+    const panel = document.getElementById('recPanel');
+    const cardsEl = document.getElementById('recCards');
+    if (!panel || !cardsEl) return;
+    cardsEl.innerHTML = '';
+    if (!items || !items.length) {
+      panel.hidden = true;
+      return;
+    }
+    panel.hidden = false;
+    for (const it of items) {
+      const card = document.createElement('div');
+      card.className = 'rec-card';
+      const top = document.createElement('div');
+      top.className = 'rec-card-top';
+      const name = document.createElement('span');
+      name.className = 'rec-name';
+      name.textContent = it.name || '';
+      const price = document.createElement('span');
+      price.className = 'rec-price';
+      price.textContent = formatRecPrice(it.price);
+      top.appendChild(name);
+      top.appendChild(price);
+      const info = document.createElement('div');
+      info.className = 'rec-info';
+      info.textContent = it.info || '';
+      card.appendChild(top);
+      card.appendChild(info);
+      cardsEl.appendChild(card);
+    }
+  }
+
+  function updateLatencyUI() {
+    const el = document.getElementById('latency');
+    const parts = [];
+    if (latFirstTextMs != null) parts.push(`first text ${Math.round(latFirstTextMs)} ms`);
+    if (latFirstAudioMs != null) parts.push(`first audio ${Math.round(latFirstAudioMs)} ms`);
+    if (!parts.length) {
+      el.textContent = 'Latency — speak a phrase, then check after reply';
+      el.classList.remove('has-data');
+      return;
+    }
+    el.textContent = 'Latency (this turn): ' + parts.join(' · ');
+    el.classList.add('has-data');
+    console.info('[kellner latency]', {
+      firstTextMs: latFirstTextMs != null ? Math.round(latFirstTextMs) : null,
+      firstAudioMs: latFirstAudioMs != null ? Math.round(latFirstAudioMs) : null,
+    });
+  }
 
   function playbackMatchesTurn(msg, allowBootstrap) {
     const t = Number(msg.turn_id);
@@ -209,12 +380,27 @@
         setStatus('Heard: ' + (msg.text || '…'), true);
       } else if (msg.type === 'transcript') {
         playbackTurnId = Number(msg.turn_id);
+        clearRecommendations();
+        latTurnStart = performance.now();
+        latGotFirstText = false;
+        latGotFirstAudio = false;
+        latFirstTextMs = null;
+        latFirstAudioMs = null;
+        updateLatencyUI();
         addBubble(msg.text, 'user');
         assistantBubble = addBubble('…', 'assistant typing');
         setStatus('Thinking…', true);
         assistantSpeaking = false;
+      } else if (msg.type === 'recommendations') {
+        if (Number(msg.turn_id) !== Number(playbackTurnId)) return;
+        renderRecommendations(msg.items);
       } else if (msg.type === 'assistant_text_delta') {
         if (!playbackMatchesTurn(msg, false)) return;
+        if (latTurnStart != null && !latGotFirstText) {
+          latGotFirstText = true;
+          latFirstTextMs = performance.now() - latTurnStart;
+          updateLatencyUI();
+        }
         if (assistantBubble) {
           assistantBubble.classList.remove('typing');
           const cur = assistantBubble.textContent === '…' ? '' : assistantBubble.textContent + ' ';
@@ -223,6 +409,11 @@
         setStatus('Speaking…', true);
       } else if (msg.type === 'audio_delta') {
         if (!playbackMatchesTurn(msg, true)) return;
+        if (latTurnStart != null && !latGotFirstAudio) {
+          latGotFirstAudio = true;
+          latFirstAudioMs = performance.now() - latTurnStart;
+          updateLatencyUI();
+        }
         assistantSpeaking = true;
         bargeInAllowedAfter = performance.now() + 1400;
         await playPcmB64(msg.b64, Number(msg.turn_id));

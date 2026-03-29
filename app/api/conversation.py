@@ -4,14 +4,17 @@ import json
 import os
 import tempfile
 import time
+import uuid
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from app.config import config
 from app.services.llm_service import LLMService
 from app.services.retrieval_service import RetrievalService
 from app.services.stt_continuous_service import STTContinuousSession
 from app.services.stt_service import STTService
+from app.services.session_context import ConversationSession, attach_session, reset_session
 from app.services.tts_streaming_service import StreamingTTSService
 
 router = APIRouter()
@@ -37,9 +40,12 @@ async def _run_assistant_turn(
     history: list,
     transcript: str,
     turn_id: int,
+    conv_session: ConversationSession,
 ) -> None:
     if not transcript.strip():
         return
+
+    streaming_tts.reset_for_new_turn()
 
     await websocket.send_json({
         "type": "transcript",
@@ -50,15 +56,31 @@ async def _run_assistant_turn(
     context = retrieval_service.retrieve(transcript)
     messages = llm_service._build_messages(transcript, history, context)
 
+    # ContextVar must be set in *this* task before asyncio.to_thread so the worker sees it
+    # (STT schedules this coroutine via run_coroutine_threadsafe — it does not inherit ws handler context).
+    ctx_token = attach_session(conv_session)
+    menu_recommendations: list = []
     try:
-        messages, direct = await asyncio.to_thread(llm_service.resolve_tools, messages)
+        messages, direct, menu_recommendations = await asyncio.to_thread(
+            llm_service.resolve_tools, messages
+        )
     except Exception as e:
         if "431" in str(e) or "tool" in str(e).lower():
             messages = llm_service._build_messages(transcript, history, context)
             direct = None
+            menu_recommendations = []
         else:
             await websocket.send_json({"type": "error", "message": str(e), "turn_id": turn_id})
             return
+    finally:
+        reset_session(ctx_token)
+
+    if menu_recommendations:
+        await websocket.send_json({
+            "type": "recommendations",
+            "turn_id": turn_id,
+            "items": menu_recommendations,
+        })
 
     text_q: asyncio.Queue = asyncio.Queue()
     SENTINEL = object()
@@ -147,6 +169,7 @@ async def _batch_wav_turn(
     history: list,
     audio_data: bytes,
     turn_id: int,
+    conv_session: ConversationSession,
 ) -> None:
     t0 = time.perf_counter()
     suffix = ".wav" if audio_data[:4] == b"RIFF" else ".webm"
@@ -158,7 +181,7 @@ async def _batch_wav_turn(
     finally:
         os.unlink(tmp_path)
     print(f"[TIMING] STT (batch): {time.perf_counter() - t0:.2f}s → '{transcript}'")
-    await _run_assistant_turn(websocket, history, transcript, turn_id)
+    await _run_assistant_turn(websocket, history, transcript, turn_id, conv_session)
 
 
 @router.websocket("/ws/conversation")
@@ -170,9 +193,15 @@ async def ws_conversation(websocket: WebSocket):
       - Legacy: single binary WAV (RIFF…) → batch STT.
 
     Server → client:
-      transcript, assistant_text_delta, audio_delta (raw PCM base64), done, error (all with turn_id where relevant).
+      transcript, recommendations (optional, after menu search), assistant_text_delta,
+      audio_delta (raw PCM base64), done, error (all with turn_id where relevant).
     """
     await websocket.accept()
+    conv_session = ConversationSession(
+        session_id=str(uuid.uuid4()),
+        hotel_id=config.DEFAULT_HOTEL_ID,
+        customer_id=config.DEFAULT_CUSTOMER_ID,
+    )
     history: list = []
     turn_seq = 0
     assistant_task: Optional[asyncio.Task] = None
@@ -200,7 +229,7 @@ async def ws_conversation(websocket: WebSocket):
             turn_seq += 1
             tid = turn_seq
             assistant_task = asyncio.create_task(
-                _run_assistant_turn(websocket, history, text, tid)
+                _run_assistant_turn(websocket, history, text, tid, conv_session)
             )
             assistant_task.add_done_callback(_log_assistant_task)
 
@@ -240,7 +269,7 @@ async def ws_conversation(websocket: WebSocket):
                 if b[:4] == b"RIFF" and stt is None:
                     await cancel_assistant()
                     turn_seq += 1
-                    await _batch_wav_turn(websocket, history, b, turn_seq)
+                    await _batch_wav_turn(websocket, history, b, turn_seq, conv_session)
                     continue
 
                 if stt is None:

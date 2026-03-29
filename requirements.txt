@@ -16,6 +16,9 @@ azure-cognitiveservices-speech>=1.34.0
 # PostgreSQL + pgvector — context search
 psycopg2-binary>=2.9.0
 
+# MongoDB — orders
+pymongo>=4.6.0
+
 # Load .env for local development
 python-dotenv>=1.0.0
 

@@ -7,12 +7,69 @@ from openai import AsyncAzureOpenAI, AzureOpenAI
 from app.config import config
 from app.services.tool_executor import ToolExecutor
 
+
+def _recommendations_from_get_menu_json(result_json: str) -> List[Dict[str, Any]]:
+    """Parse get_menu_items tool output into UI-friendly rows (only when search succeeded)."""
+    try:
+        data = json.loads(result_json)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict) or data.get("error"):
+        return []
+    raw = data.get("items")
+    if not isinstance(raw, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        name = it.get("name")
+        if not name:
+            continue
+        desc = (it.get("description") or "").strip()
+        cuisine = (it.get("cuisine_type") or "").strip()
+        info_parts = [p for p in [cuisine, desc[:280] if desc else ""] if p]
+        info = " · ".join(info_parts) if info_parts else ""
+        price = it.get("price")
+        if price is not None:
+            try:
+                price = float(price)
+            except (TypeError, ValueError):
+                price = None
+        out.append({"name": str(name), "price": price, "info": info})
+    return out
+
 _SYSTEM_PROMPT = """You are a professional restaurant waiter. Be warm, concise, and helpful.
 - Use tools to fetch real menu data before answering menu questions.
-- If a guest asks to place, modify, or cancel an order, use the appropriate tool.
+- Before adding items, call get_current_order if unsure what is already on the ticket. Do NOT call place_order again for a dish that is already on the order unless the guest clearly asks to add more (e.g. "another", "one more", "add a second", "extra portion"). If they only mention a dish again in passing (e.g. "I love the tiramisu") without asking to add more, acknowledge it — do not place_order.
+- When the guest confirms NEW items to add, call place_order with exact dish names from the menu (list of strings) and table_number if they gave one. Repeating a name in the same list increases quantity for that dish (e.g. two entries "Tiramisu" means two). The tool response includes order_id and line_id per line.
+- To change quantity or remove a line, use modify_order with action set_quantity or remove_item; pass line_id from the last order snapshot or dish_name matching the item. Status: draft = taking order, then confirmed, then completed — use modify_order action set_status with new_status.
+- cancel_order is still a stub if asked.
+- For review_and_feedback: NEVER invent a rating or paraphrase praise. overall_rating MUST be the exact number the guest stated (1–5). feedback_text MUST be their actual words about the meal (or a faithful short quote), including complaints — do not substitute generic positive text. If they did not give a rating or comment yet, omit those fields or only set bill_requested.
+- After get_menu_items, reply in a natural, conversational way. The guest will see the matching dishes on screen (name, price, description) — you do not need to read every item or price aloud; a short reaction plus an offer to help choose is enough.
 - Keep replies short enough to speak aloud comfortably — no lists or markdown."""
 
 _TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_order",
+            "description": (
+                "Return the guest's current order for this session (line items, quantities, subtotal, status). "
+                "Call before place_order when the guest might already have items on the ticket, to avoid duplicate orders."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "Optional Mongo order id; omit to use the active session order.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -77,17 +134,91 @@ _TOOLS = [
         "type": "function",
         "function": {
             "name": "modify_order",
-            "description": "Modify an existing order.",
+            "description": (
+                "Modify the guest's order in MongoDB. action set_quantity: set quantity (needs line_id or dish_name, quantity>=1). "
+                "action remove_item: delete a line (line_id or dish_name). "
+                "action set_status: new_status draft (taking order), confirmed, or completed. "
+                "order_id optional — defaults to the active session order."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "order_id": {"type": "string"},
-                    "changes": {
+                    "action": {
                         "type": "string",
-                        "description": "Description of changes to make.",
+                        "enum": ["set_quantity", "remove_item", "set_status"],
+                        "description": "set_quantity | remove_item | set_status",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "Mongo order id; omit to use the current session order.",
+                    },
+                    "line_id": {
+                        "type": "string",
+                        "description": "line_id from place_order / modify_order response (for set_quantity or remove_item).",
+                    },
+                    "dish_name": {
+                        "type": "string",
+                        "description": "Menu item name if line_id unknown (matches one line).",
+                    },
+                    "quantity": {
+                        "type": "integer",
+                        "description": "Required for set_quantity.",
+                    },
+                    "new_status": {
+                        "type": "string",
+                        "enum": ["draft", "confirmed", "completed", "taking_order"],
+                        "description": "Required for set_status. draft = still taking order.",
                     },
                 },
-                "required": ["order_id", "changes"],
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "review_and_feedback",
+            "description": (
+                "Record bill request and/or post-meal feedback on the guest's order document. "
+                "CRITICAL: overall_rating MUST be the integer the guest actually said (1–5). "
+                "feedback_text MUST be their real words (or exact quote), including negative feedback — never fabricate. "
+                "Use when they ask for the bill (bill_requested=true) and/or give ratings or comments. "
+                "Merges into the same Mongo order (review + billing fields)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bill_requested": {
+                        "type": "boolean",
+                        "description": "True when the guest asks for the check / bill.",
+                    },
+                    "overall_rating": {
+                        "type": "integer",
+                        "description": "1–5 only. Must match what the guest said (e.g. 'three stars' → 3). Do not default to 5.",
+                    },
+                    "feedback_text": {
+                        "type": "string",
+                        "description": "Verbatim or faithful summary of what the guest said about the meal. Include complaints if any.",
+                    },
+                    "item_feedback": {
+                        "type": "array",
+                        "description": "Optional per-item ratings.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "line_id": {"type": "string"},
+                                "dish_name": {"type": "string"},
+                                "rating": {"type": "integer", "description": "1–5"},
+                                "comment": {"type": "string"},
+                            },
+                        },
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "Mongo order id; omit for the current session order.",
+                    },
+                },
+                "required": [],
             },
         },
     },
@@ -169,8 +300,9 @@ class LLMService:
             LLMService._customer_cache[key] = json.loads(raw)
         return LLMService._customer_cache[key]
 
-    def resolve_tools(self, messages: list) -> Tuple[list, Optional[str]]:
-        """First LLM phase: tools only, non-streaming. Returns (messages_incl_tool_results, direct_answer_or_None)."""
+    def resolve_tools(self, messages: list) -> Tuple[list, Optional[str], List[Dict[str, Any]]]:
+        """First LLM phase: tools only, non-streaming. Returns (messages, direct_answer_or_None, menu_recommendations)."""
+        menu_recommendations: List[Dict[str, Any]] = []
         call_num = 0
         while True:
             call_num += 1
@@ -181,14 +313,14 @@ class LLMService:
                 tools=_TOOLS,
                 tool_choice="auto",
                 max_tokens=400,
-                temperature=0.7,
+                temperature=0.2,
             )
             print(f"  [LLM] call #{call_num} (tools): {time.perf_counter() - t:.2f}s")
             msg = response.choices[0].message
             if not msg.tool_calls:
                 answer = (msg.content or "").strip()
                 print(f"  [LLM] no tool calls — direct ({len(answer)} chars)")
-                return messages, answer if answer else None
+                return messages, answer if answer else None, menu_recommendations
             tool_names = [tc.function.name for tc in msg.tool_calls]
             print(f"  [LLM] tool calls: {tool_names}")
             messages.append(msg)
@@ -197,6 +329,8 @@ class LLMService:
                 t_tool = time.perf_counter()
                 result = self._executor.run(tc.function.name, args)
                 print(f"  [TOOL] {tc.function.name}({args}): {time.perf_counter() - t_tool:.2f}s")
+                if tc.function.name == "get_menu_items":
+                    menu_recommendations = _recommendations_from_get_menu_json(result)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -248,7 +382,7 @@ class LLMService:
         """Sync iterator for legacy batch clients (e.g. test scripts)."""
         messages = self._build_messages(user_query, history, context)
         try:
-            messages, direct = self.resolve_tools(messages)
+            messages, direct, _ = self.resolve_tools(messages)
         except Exception as e:
             if "431" in str(e) or "tool" in str(e).lower():
                 messages = self._build_messages(user_query, history, context)

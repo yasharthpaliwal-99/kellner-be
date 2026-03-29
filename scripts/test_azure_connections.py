@@ -3,8 +3,8 @@
 Connectivity smoke test for kellner.
 
 Checks:
-1. Azure Speech TTS
-2. Azure OpenAI (list deployments / simple completion)
+1. Azure OpenAI TTS (gpt-4o-mini-tts)
+2. Azure OpenAI chat (deployment smoke test)
 
 Run from the kellner directory:
   python scripts/test_azure_connections.py
@@ -27,25 +27,24 @@ def load_env() -> None:
         pass
 
 
-def test_speech_tts() -> bool:
+def test_openai_tts() -> bool:
     from app.config import config
-    from app.services.tts_service import TTSService
+    from app.services.tts_streaming_service import StreamingTTSService
 
-    if not config.AZURE_SPEECH_KEY or not config.AZURE_SPEECH_REGION:
-        print("SKIP Speech: set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in .env")
+    if not config.AZURE_OPENAI_TTS_ENDPOINT or not config.AZURE_OPENAI_TTS_API_KEY:
+        print("SKIP OpenAI TTS: set AZURE_OPENAI_TTS_ENDPOINT and AZURE_OPENAI_TTS_API_KEY in .env")
         return True
 
     try:
-        out_path = TTSService().synthesize("Connection test.")
-        size = Path(out_path).stat().st_size
-        Path(out_path).unlink(missing_ok=True)
-        if size == 0:
-            print("FAIL Speech TTS: empty audio response")
+        tts = StreamingTTSService()
+        pcm = tts.synthesize_segment_pcm("Connection test.")
+        if len(pcm) < 200:
+            print("FAIL OpenAI TTS: empty or tiny PCM response")
             return False
-        print(f"OK   Speech TTS ({size} bytes)")
+        print(f"OK   Azure OpenAI TTS ({len(pcm)} PCM bytes @ 16k mono)")
         return True
     except Exception as e:
-        print(f"FAIL Speech TTS: {e}")
+        print(f"FAIL OpenAI TTS: {e}")
         return False
 
 
@@ -83,10 +82,10 @@ def main() -> int:
     args = sys.argv[1:]
     if "--llm-only" in args:
         ok = test_openai()
-    elif "--speech-only" in args:
-        ok = test_speech_tts()
+    elif "--tts-only" in args:
+        ok = test_openai_tts()
     else:
-        ok = test_speech_tts() and test_openai()
+        ok = test_openai_tts() and test_openai()
     print("\nAll connectivity checks passed." if ok else "\nConnectivity check failed.")
     return 0 if ok else 1
 
