@@ -321,9 +321,10 @@ class LLMService:
             LLMService._customer_cache[key] = json.loads(raw)
         return LLMService._customer_cache[key]
 
-    def resolve_tools(self, messages: list) -> Tuple[list, Optional[str], List[Dict[str, Any]]]:
-        """First LLM phase: tools only, non-streaming. Returns (messages, direct_answer_or_None, menu_recommendations)."""
+    def resolve_tools(self, messages: list) -> Tuple[list, Optional[str], List[Dict[str, Any]], bool]:
+        """First LLM phase: tools only, non-streaming. Returns (messages, direct_answer_or_None, menu_recommendations, tools_called)."""
         menu_recommendations: List[Dict[str, Any]] = []
+        tools_called = False
         call_num = 0
         while True:
             call_num += 1
@@ -341,9 +342,10 @@ class LLMService:
             if not msg.tool_calls:
                 answer = (msg.content or "").strip()
                 print(f"  [LLM] no tool calls — direct ({len(answer)} chars)")
-                return messages, answer if answer else None, menu_recommendations
+                return messages, answer if answer else None, menu_recommendations, tools_called
             tool_names = [tc.function.name for tc in msg.tool_calls]
             print(f"  [LLM] tool calls: {tool_names}")
+            tools_called = True
             messages.append(msg)
             for tc in msg.tool_calls:
                 args = json.loads(tc.function.arguments or "{}")
@@ -403,7 +405,7 @@ class LLMService:
         """Sync iterator for legacy batch clients (e.g. test scripts)."""
         messages = self._build_messages(user_query, history, context)
         try:
-            messages, direct, _ = self.resolve_tools(messages)
+            messages, direct, _, _ = self.resolve_tools(messages)
         except Exception as e:
             if "431" in str(e) or "tool" in str(e).lower():
                 messages = self._build_messages(user_query, history, context)

@@ -2,7 +2,6 @@ import asyncio
 import base64
 import json
 import os
-import random
 import tempfile
 import time
 import uuid
@@ -56,74 +55,32 @@ async def _run_assistant_turn(
         "turn_id": turn_id,
     })
 
-    # UX filler: after the user stops speaking, we may have a 5-7s delay until
-    # the first assistant audio arrives. We play a tiny (<=2s) "casual waiter"
-    # line while tools + LLM run, then stop immediately when real assistant
-    # output starts. Filler must NOT be added to `full_segments/history`.
+    # UX filler: optional single generic line while tools + LLM run.
+    # Filler must NOT be added to `full_segments/history`.
     filler_task: Optional[asyncio.Task] = None
     real_output_started = asyncio.Event()
     if enable_filler:
-        FILLER_PHRASES = [
-            "Alright, I got this.",
-            "Let me check for that.",
-            "One moment, please.",
-            "Sure, checking now.",
-            "Got it—give me a sec.",
-            "I’m on it.",
-            "Let me look into that.",
-            "Just a moment.",
-            "Alright, checking options.",
-            "Sure—working on it.",
-            "Let me verify that.",
-            "I’ll take a look.",
-            "Perfect—one quick moment.",
-            "Let me confirm for you.",
-            "Okay—checking now.",
-            "Thanks, let me see.",
-            "Great—give me a second.",
-            "Let me check the menu.",
-        ]
-
         async def _filler_controller() -> None:
             try:
-                t_start = time.perf_counter()
-                max_filler_seconds = 2.0
+                phrase = "One moment, please."
+                pcm = await asyncio.to_thread(streaming_tts.synthesize_segment_pcm, phrase)
+                if real_output_started.is_set() or not pcm:
+                    return
 
-                while not real_output_started.is_set():
-                    if time.perf_counter() - t_start >= max_filler_seconds:
-                        break
+                await websocket.send_json({
+                    "type": "assistant_text_delta",
+                    "text": phrase,
+                    "turn_id": turn_id,
+                })
 
-                    phrase = random.choice(FILLER_PHRASES).strip()
-                    if not phrase:
-                        continue
-
-                    pcm = await asyncio.to_thread(
-                        streaming_tts.synthesize_segment_pcm, phrase
-                    )
-                    if real_output_started.is_set():
-                        break
-                    if not pcm:
-                        # If TTS failed/empty, don't spam text.
-                        continue
-
+                chunk_size = 4096
+                for i in range(0, len(pcm), chunk_size):
+                    chunk = pcm[i : i + chunk_size]
                     await websocket.send_json({
-                        "type": "assistant_text_delta",
-                        "text": phrase,
+                        "type": "audio_delta",
                         "turn_id": turn_id,
+                        "b64": base64.b64encode(chunk).decode("ascii"),
                     })
-
-                    chunk_size = 4096
-                    for i in range(0, len(pcm), chunk_size):
-                        chunk = pcm[i : i + chunk_size]
-                        await websocket.send_json({
-                            "type": "audio_delta",
-                            "turn_id": turn_id,
-                            "b64": base64.b64encode(chunk).decode("ascii"),
-                        })
-
-                    # If real output started while we were speaking filler, stop.
-                    if real_output_started.is_set():
-                        break
 
             except asyncio.CancelledError:
                 # Do not call streaming_tts.stop() here: it would cancel real narration.
@@ -138,8 +95,9 @@ async def _run_assistant_turn(
     # (STT schedules this coroutine via run_coroutine_threadsafe — it does not inherit ws handler context).
     ctx_token = attach_session(conv_session)
     menu_recommendations: list = []
+    tools_called = False
     try:
-        messages, direct, menu_recommendations = await asyncio.to_thread(
+        messages, direct, menu_recommendations, tools_called = await asyncio.to_thread(
             llm_service.resolve_tools, messages
         )
     except Exception as e:
@@ -147,11 +105,15 @@ async def _run_assistant_turn(
             messages = llm_service._build_messages(transcript, history, context)
             direct = None
             menu_recommendations = []
+            tools_called = False
         else:
             await websocket.send_json({"type": "error", "message": str(e), "turn_id": turn_id})
             return
     finally:
         reset_session(ctx_token)
+
+    if not tools_called and filler_task and not filler_task.done():
+        filler_task.cancel()
 
     if menu_recommendations:
         await websocket.send_json({
