@@ -600,3 +600,57 @@ def review_and_feedback(
         "billing": billing,
         "message": "Saved billing / feedback on this order.",
     }
+
+
+def bring_the_bill(order_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Mark the session order as bill requested.
+    """
+    col = get_orders_collection()
+    if col is None:
+        return {"ok": False, "error": "MongoDB is not configured (set MONGODB_URI in .env)."}
+
+    sess = get_session()
+    if sess is None:
+        return {"ok": False, "error": "No active conversation session."}
+
+    doc, err = _load_order_for_session(
+        col,
+        sess,
+        order_id,
+        statuses=["draft", "confirmed", "completed"],
+    )
+    if err or not doc:
+        return {"ok": False, "error": err or "Order not found."}
+
+    now = _utcnow()
+    billing = dict(doc.get("billing") or {})
+    billing["bill_requested_at"] = now
+    new_version = int(doc.get("version") or 1) + 1
+
+    col.update_one(
+        {"_id": doc["_id"]},
+        {
+            "$set": {
+                "bill_requested": True,
+                "billing": billing,
+                "updated_at": now,
+                "version": new_version,
+            },
+            "$push": {
+                "events": {
+                    "at": now,
+                    "type": "bring_the_bill",
+                    "detail": {"bill_requested": True},
+                }
+            },
+        },
+    )
+    sess.order_id = str(doc["_id"])
+    return {
+        "ok": True,
+        "order_id": str(doc["_id"]),
+        "bill_requested": True,
+        "billing": billing,
+        "message": "Bill has been requested.",
+    }

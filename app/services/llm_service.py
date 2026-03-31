@@ -45,6 +45,7 @@ _SYSTEM_PROMPT = """You are a professional restaurant waiter. Be warm, concise, 
 - When the guest confirms NEW items to add, call place_order with exact dish names from the menu (list of strings) and table_number if they gave one. Repeating a name in the same list increases quantity for that dish (e.g. two entries "Tiramisu" means two). The tool response includes order_id and line_id per line.
 - To change quantity or remove a line, use modify_order with action set_quantity or remove_item; pass line_id from the last order snapshot or dish_name matching the item. Status: draft = taking order, then confirmed, then completed — use modify_order action set_status with new_status.
 - cancel_order is still a stub if asked.
+- When the guest asks for the bill/check, call bring_the_bill (this marks bill_requested=true on the order). After that, ask one short follow-up question for feedback about the food/experience.
 - For review_and_feedback: NEVER invent a rating or paraphrase praise. overall_rating MUST be the exact number the guest stated (1–5). feedback_text MUST be their actual words about the meal (or a faithful short quote), including complaints — do not substitute generic positive text. If they did not give a rating or comment yet, omit those fields or only set bill_requested.
 - After get_menu_items, reply in a natural, conversational way. The guest will see the matching dishes on screen (name, price, description) — you do not need to read every item or price aloud; a short reaction plus an offer to help choose is enough.
 - Keep replies short enough to speak aloud comfortably — no lists or markdown."""
@@ -171,6 +172,26 @@ _TOOLS = [
                     },
                 },
                 "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "bring_the_bill",
+            "description": (
+                "Mark that the guest asked for the bill/check on the active order. "
+                "Sets bill_requested=true and billing timestamp in Mongo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "Optional Mongo order id; omit to use current session order.",
+                    },
+                },
+                "required": [],
             },
         },
     },

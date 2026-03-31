@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import random
 import tempfile
 import time
 import uuid
@@ -10,6 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.config import config
+from app.services.device_auth_service import validate_device_session
 from app.services.llm_service import LLMService
 from app.services.retrieval_service import RetrievalService
 from app.services.stt_continuous_service import STTContinuousSession
@@ -41,6 +43,7 @@ async def _run_assistant_turn(
     transcript: str,
     turn_id: int,
     conv_session: ConversationSession,
+    enable_filler: bool = True,
 ) -> None:
     if not transcript.strip():
         return
@@ -52,6 +55,81 @@ async def _run_assistant_turn(
         "text": transcript,
         "turn_id": turn_id,
     })
+
+    # UX filler: after the user stops speaking, we may have a 5-7s delay until
+    # the first assistant audio arrives. We play a tiny (<=2s) "casual waiter"
+    # line while tools + LLM run, then stop immediately when real assistant
+    # output starts. Filler must NOT be added to `full_segments/history`.
+    filler_task: Optional[asyncio.Task] = None
+    real_output_started = asyncio.Event()
+    if enable_filler:
+        FILLER_PHRASES = [
+            "Alright, I got this.",
+            "Let me check for that.",
+            "One moment, please.",
+            "Sure, checking now.",
+            "Got it—give me a sec.",
+            "I’m on it.",
+            "Let me look into that.",
+            "Just a moment.",
+            "Alright, checking options.",
+            "Sure—working on it.",
+            "Let me verify that.",
+            "I’ll take a look.",
+            "Perfect—one quick moment.",
+            "Let me confirm for you.",
+            "Okay—checking now.",
+            "Thanks, let me see.",
+            "Great—give me a second.",
+            "Let me check the menu.",
+        ]
+
+        async def _filler_controller() -> None:
+            try:
+                t_start = time.perf_counter()
+                max_filler_seconds = 2.0
+
+                while not real_output_started.is_set():
+                    if time.perf_counter() - t_start >= max_filler_seconds:
+                        break
+
+                    phrase = random.choice(FILLER_PHRASES).strip()
+                    if not phrase:
+                        continue
+
+                    pcm = await asyncio.to_thread(
+                        streaming_tts.synthesize_segment_pcm, phrase
+                    )
+                    if real_output_started.is_set():
+                        break
+                    if not pcm:
+                        # If TTS failed/empty, don't spam text.
+                        continue
+
+                    await websocket.send_json({
+                        "type": "assistant_text_delta",
+                        "text": phrase,
+                        "turn_id": turn_id,
+                    })
+
+                    chunk_size = 4096
+                    for i in range(0, len(pcm), chunk_size):
+                        chunk = pcm[i : i + chunk_size]
+                        await websocket.send_json({
+                            "type": "audio_delta",
+                            "turn_id": turn_id,
+                            "b64": base64.b64encode(chunk).decode("ascii"),
+                        })
+
+                    # If real output started while we were speaking filler, stop.
+                    if real_output_started.is_set():
+                        break
+
+            except asyncio.CancelledError:
+                # Do not call streaming_tts.stop() here: it would cancel real narration.
+                return
+
+        filler_task = asyncio.create_task(_filler_controller())
 
     context = retrieval_service.retrieve(transcript)
     messages = llm_service._build_messages(transcript, history, context)
@@ -121,12 +199,19 @@ async def _run_assistant_turn(
             seg = item
             full_segments.append(seg)
 
+            is_first_segment = first_audio
             t_tts = time.perf_counter()
+            if is_first_segment:
+                # Real assistant output is starting; stop filler immediately.
+                real_output_started.set()
+                if filler_task and not filler_task.done():
+                    filler_task.cancel()
+                first_audio = False
+
             pcm = await asyncio.to_thread(streaming_tts.synthesize_segment_pcm, seg)
-            if first_audio:
+            if is_first_segment:
                 print(f"[TIMING] first segment TTS synth: {time.perf_counter() - t_tts:.2f}s (turn {turn_id})")
                 print(f"[TIMING] Total to first segment audio ready: {time.perf_counter() - t0:.2f}s")
-                first_audio = False
 
             await websocket.send_json({
                 "type": "assistant_text_delta",
@@ -153,6 +238,8 @@ async def _run_assistant_turn(
             await producer_task
         except asyncio.CancelledError:
             pass
+        if filler_task and not filler_task.done():
+            filler_task.cancel()
 
     if full_segments:
         history.append({"role": "user", "content": transcript})
@@ -181,7 +268,14 @@ async def _batch_wav_turn(
     finally:
         os.unlink(tmp_path)
     print(f"[TIMING] STT (batch): {time.perf_counter() - t0:.2f}s → '{transcript}'")
-    await _run_assistant_turn(websocket, history, transcript, turn_id, conv_session)
+    await _run_assistant_turn(
+        websocket,
+        history,
+        transcript,
+        turn_id,
+        conv_session,
+        enable_filler=False,
+    )
 
 
 @router.websocket("/ws/conversation")
@@ -196,10 +290,16 @@ async def ws_conversation(websocket: WebSocket):
       transcript, recommendations (optional, after menu search), assistant_text_delta,
       audio_delta (raw PCM base64), done, error (all with turn_id where relevant).
     """
+    sid = (websocket.query_params.get("session_id") or "").strip()
+    sess_doc, sess_err = validate_device_session(sid, role="device")
+    if sess_err:
+        await websocket.close(code=1008, reason=sess_err)
+        return
+
     await websocket.accept()
     conv_session = ConversationSession(
         session_id=str(uuid.uuid4()),
-        hotel_id=config.DEFAULT_HOTEL_ID,
+        hotel_id=int(sess_doc.get("hotel_id") or config.DEFAULT_HOTEL_ID),
         customer_id=config.DEFAULT_CUSTOMER_ID,
     )
     history: list = []
@@ -229,7 +329,14 @@ async def ws_conversation(websocket: WebSocket):
             turn_seq += 1
             tid = turn_seq
             assistant_task = asyncio.create_task(
-                _run_assistant_turn(websocket, history, text, tid, conv_session)
+                _run_assistant_turn(
+                    websocket,
+                    history,
+                    text,
+                    tid,
+                    conv_session,
+                    enable_filler=True,
+                )
             )
             assistant_task.add_done_callback(_log_assistant_task)
 

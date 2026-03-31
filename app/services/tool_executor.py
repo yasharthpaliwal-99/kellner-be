@@ -11,6 +11,7 @@ from typing import Any, Dict
 from app.db.pool import get_pool
 from app.services.embedding_service import embed
 from app.services.order_service import get_current_order_snapshot
+from app.services.order_service import bring_the_bill as persist_bring_the_bill
 from app.services.order_service import modify_order as persist_modify_order
 from app.services.order_service import place_order as persist_place_order
 from app.services.order_service import review_and_feedback as persist_review_and_feedback
@@ -212,6 +213,13 @@ class ToolExecutor:
             item_feedback=item_feedback,
             order_id=oid,
         )
+        return _dumps(result)
+
+    def _tool_bring_the_bill(self, args: Dict[str, Any]) -> str:
+        oid = args.get("order_id")
+        if oid is not None:
+            oid = str(oid).strip() or None
+        result = persist_bring_the_bill(order_id=oid)
         return _dumps(result)
 
     def _tool_modify_order(self, args: Dict[str, Any]) -> str:
