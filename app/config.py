@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 try:
     from dotenv import load_dotenv
@@ -15,6 +15,12 @@ def _first_env(*names: str) -> Optional[str]:
         if v:
             return v
     return None
+
+
+def _csv_env_list(name: str, default: str = "") -> List[str]:
+    raw = os.getenv(name, default)
+    items = [v.strip() for v in (raw or "").split(",")]
+    return [v for v in items if v]
 
 
 class Config:
@@ -60,6 +66,12 @@ class Config:
     # Default tenant / guest for voice session until auth exists
     DEFAULT_HOTEL_ID: int = int(_first_env("DEFAULT_HOTEL_ID") or "1")
     DEFAULT_CUSTOMER_ID: int = int(_first_env("DEFAULT_CUSTOMER_ID") or "1")
+
+    # CORS allowlist for browser clients (SWA, localhost dev, etc.)
+    CORS_ALLOW_ORIGINS: List[str] = _csv_env_list(
+        "CORS_ALLOW_ORIGINS",
+        "https://nice-ground-03e95fd0f.4.azurestaticapps.net,http://localhost:5173,http://127.0.0.1:5173",
+    )
 
 
 config = Config()

@@ -8,6 +8,7 @@ from fastapi.responses import HTMLResponse
 from app.api.conversation import router as conversation_router
 from app.api.device_auth import router as device_auth_router
 from app.api.kitchen import router as kitchen_router
+from app.config import config
 from app.db.mongo import ensure_order_indexes
 from app.services.device_auth_service import ensure_device_auth_indexes
 
@@ -23,7 +24,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=config.CORS_ALLOW_ORIGINS or ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

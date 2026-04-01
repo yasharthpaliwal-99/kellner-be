@@ -1,6 +1,6 @@
 import json
 import time
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 
 from openai import AsyncAzureOpenAI, AzureOpenAI
 
@@ -321,7 +321,11 @@ class LLMService:
             LLMService._customer_cache[key] = json.loads(raw)
         return LLMService._customer_cache[key]
 
-    def resolve_tools(self, messages: list) -> Tuple[list, Optional[str], List[Dict[str, Any]], bool]:
+    def resolve_tools(
+        self,
+        messages: list,
+        on_first_tool_call: Optional[Callable[[], None]] = None,
+    ) -> Tuple[list, Optional[str], List[Dict[str, Any]], bool]:
         """First LLM phase: tools only, non-streaming. Returns (messages, direct_answer_or_None, menu_recommendations, tools_called)."""
         menu_recommendations: List[Dict[str, Any]] = []
         tools_called = False
@@ -345,7 +349,13 @@ class LLMService:
                 return messages, answer if answer else None, menu_recommendations, tools_called
             tool_names = [tc.function.name for tc in msg.tool_calls]
             print(f"  [LLM] tool calls: {tool_names}")
-            tools_called = True
+            if not tools_called:
+                tools_called = True
+                if on_first_tool_call is not None:
+                    try:
+                        on_first_tool_call()
+                    except Exception:
+                        pass
             messages.append(msg)
             for tc in msg.tool_calls:
                 args = json.loads(tc.function.arguments or "{}")

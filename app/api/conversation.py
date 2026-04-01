@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import os
+import random
 import tempfile
 import time
 import uuid
@@ -59,10 +60,26 @@ async def _run_assistant_turn(
     # Filler must NOT be added to `full_segments/history`.
     filler_task: Optional[asyncio.Task] = None
     real_output_started = asyncio.Event()
+    tool_started = asyncio.Event()
     if enable_filler:
         async def _filler_controller() -> None:
             try:
-                phrase = "One moment, please."
+                await tool_started.wait()
+                if real_output_started.is_set():
+                    return
+                phrases = [
+                    "Alright, I got this.",
+                    "Let me check that for you.",
+                    "One moment, please.",
+                    "Sure, checking now.",
+                    "I am on it.",
+                    "Got it, give me a second.",
+                    "Let me verify that.",
+                    "Thanks, checking this now.",
+                    "Okay, I am checking.",
+                    "Let me quickly confirm that.",
+                ]
+                phrase = random.choice(phrases)
                 pcm = await asyncio.to_thread(streaming_tts.synthesize_segment_pcm, phrase)
                 if real_output_started.is_set() or not pcm:
                     return
@@ -96,9 +113,13 @@ async def _run_assistant_turn(
     ctx_token = attach_session(conv_session)
     menu_recommendations: list = []
     tools_called = False
+    loop = asyncio.get_running_loop()
     try:
+        def _on_first_tool_call() -> None:
+            loop.call_soon_threadsafe(tool_started.set)
+
         messages, direct, menu_recommendations, tools_called = await asyncio.to_thread(
-            llm_service.resolve_tools, messages
+            llm_service.resolve_tools, messages, _on_first_tool_call
         )
     except Exception as e:
         if "431" in str(e) or "tool" in str(e).lower():
