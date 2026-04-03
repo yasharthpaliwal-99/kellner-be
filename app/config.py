@@ -73,5 +73,9 @@ class Config:
         "https://nice-ground-03e95fd0f.4.azurestaticapps.net,http://localhost:5173,http://127.0.0.1:5173",
     )
 
+    # Local face (InsightFace + pgvector). Optional.
+    INSIGHTFACE_ROOT: Optional[str] = _first_env("INSIGHTFACE_ROOT")
+    FACE_MATCH_MAX_DISTANCE: float = float(_first_env("FACE_MATCH_MAX_DISTANCE") or "0.45")
+
 
 config = Config()

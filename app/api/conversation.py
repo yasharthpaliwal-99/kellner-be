@@ -12,6 +12,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.config import config
 from app.services.device_auth_service import validate_device_session
+from app.services.face_local_service import customer_belongs_to_hotel
 from app.services.llm_service import LLMService
 from app.services.retrieval_service import RetrievalService
 from app.services.stt_continuous_service import STTContinuousSession
@@ -105,12 +106,10 @@ async def _run_assistant_turn(
 
         filler_task = asyncio.create_task(_filler_controller())
 
+    # ContextVar must be set before _build_messages + resolve_tools so tools + profile use real hotel/customer.
+    ctx_token = attach_session(conv_session)
     context = retrieval_service.retrieve(transcript)
     messages = llm_service._build_messages(transcript, history, context)
-
-    # ContextVar must be set in *this* task before asyncio.to_thread so the worker sees it
-    # (STT schedules this coroutine via run_coroutine_threadsafe — it does not inherit ws handler context).
-    ctx_token = attach_session(conv_session)
     menu_recommendations: list = []
     tools_called = False
     loop = asyncio.get_running_loop()
@@ -280,10 +279,20 @@ async def ws_conversation(websocket: WebSocket):
         return
 
     await websocket.accept()
+    hid = int(sess_doc.get("hotel_id") or config.DEFAULT_HOTEL_ID)
+    customer_id = int(config.DEFAULT_CUSTOMER_ID)
+    cid_raw = (websocket.query_params.get("customer_id") or "").strip()
+    if cid_raw:
+        try:
+            c = int(cid_raw)
+            if c > 0 and customer_belongs_to_hotel(c, hid):
+                customer_id = c
+        except ValueError:
+            pass
     conv_session = ConversationSession(
         session_id=str(uuid.uuid4()),
-        hotel_id=int(sess_doc.get("hotel_id") or config.DEFAULT_HOTEL_ID),
-        customer_id=config.DEFAULT_CUSTOMER_ID,
+        hotel_id=hid,
+        customer_id=customer_id,
     )
     history: list = []
     turn_seq = 0

@@ -15,6 +15,7 @@ from app.services.order_service import bring_the_bill as persist_bring_the_bill
 from app.services.order_service import modify_order as persist_modify_order
 from app.services.order_service import place_order as persist_place_order
 from app.services.order_service import review_and_feedback as persist_review_and_feedback
+from app.services.face_local_service import update_guest_profile
 from app.services.session_context import get_session
 
 
@@ -141,7 +142,7 @@ class ToolExecutor:
                     """
                     SELECT name, dietary_preferences, allergens, preferred_cuisines,
                            favorite_dishes, disliked_ingredients, visit_count,
-                           last_visit, total_spend, notes
+                           last_visit, total_spend, notes, age
                     FROM customers
                     WHERE customer_id = %s AND hotel_id = %s
                     LIMIT 1
@@ -165,6 +166,7 @@ class ToolExecutor:
                 "last_visit": str(row[7]) if row[7] else None,
                 "total_spend": float(row[8]) if row[8] else 0,
                 "notes": row[9],
+                "age": row[10],
             })
         except Exception as e:
             return _dumps({"error": str(e)})
@@ -257,3 +259,32 @@ class ToolExecutor:
     def _tool_cancel_order(self, args: Dict[str, Any]) -> str:
         # Phase 2: DELETE /api/orders/{order_id}
         return _dumps({"status": "not_implemented", "message": "Order cancellation coming in Phase 2."})
+
+    def _tool_update_guest_profile(self, args: Dict[str, Any]) -> str:
+        name = (args.get("name") or "").strip()
+        if not name:
+            return _dumps({"ok": False, "error": "name is required."})
+        age_raw = args.get("age")
+        age = None
+        if age_raw is not None and str(age_raw).strip() != "":
+            try:
+                age = int(age_raw)
+            except (TypeError, ValueError):
+                try:
+                    age = int(float(age_raw))
+                except (TypeError, ValueError):
+                    age = None
+        sess = get_session()
+        if sess is None:
+            return _dumps({"ok": False, "error": "No active session."})
+        result = update_guest_profile(
+            customer_id=int(sess.customer_id),
+            hotel_id=int(sess.hotel_id),
+            name=name,
+            age=age,
+        )
+        if result.get("ok"):
+            from app.services.llm_service import LLMService
+
+            LLMService.clear_customer_cache(int(sess.customer_id), int(sess.hotel_id))
+        return _dumps(result)

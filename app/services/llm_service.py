@@ -5,6 +5,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 from openai import AsyncAzureOpenAI, AzureOpenAI
 
 from app.config import config
+from app.services.session_context import get_session
 from app.services.tool_executor import ToolExecutor
 
 
@@ -48,7 +49,8 @@ _SYSTEM_PROMPT = """You are a professional restaurant waiter. Be warm, concise, 
 - When the guest asks for the bill/check, call bring_the_bill (this marks bill_requested=true on the order). After that, ask one short follow-up question for feedback about the food/experience.
 - For review_and_feedback: NEVER invent a rating or paraphrase praise. overall_rating MUST be the exact number the guest stated (1–5). feedback_text MUST be their actual words about the meal (or a faithful short quote), including complaints — do not substitute generic positive text. If they did not give a rating or comment yet, omit those fields or only set bill_requested.
 - After get_menu_items, reply in a natural, conversational way. The guest will see the matching dishes on screen (name, price, description) — you do not need to read every item or price aloud; a short reaction plus an offer to help choose is enough.
-- Keep replies short enough to speak aloud comfortably — no lists or markdown."""
+- Keep replies short enough to speak aloud comfortably — no lists or markdown.
+- The "Guest profile" paragraph below (if present) is the source of truth. If it already includes a name, greet by name and do not ask for name or age again. If it includes an age, do not ask for age unless the guest wants to correct it. Only when that paragraph says name is not set yet (or no guest profile line exists), ask for name and age and then call update_guest_profile. Until name is saved in that case, avoid placing food orders unless the guest insists on ordering without sharing."""
 
 _TOOLS = [
     {
@@ -257,6 +259,27 @@ _TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_guest_profile",
+            "description": (
+                "Save the guest's name and age after they explicitly provide them. "
+                "Use only when name is not already in the Guest profile or they are correcting it."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Guest's name as they gave it."},
+                    "age": {
+                        "type": "integer",
+                        "description": "Guest's age as an integer if they gave it; omit if unknown.",
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
 ]
 
 
@@ -292,6 +315,10 @@ def _maybe_force_flush(buffer: str, max_chars: int = 140) -> Tuple[Optional[str]
 
 class LLMService:
     _customer_cache: Dict[tuple, dict] = {}
+
+    @classmethod
+    def clear_customer_cache(cls, customer_id: int, hotel_id: int) -> None:
+        cls._customer_cache.pop((customer_id, hotel_id), None)
 
     def __init__(self) -> None:
         if not config.AZURE_OPENAI_ENDPOINT or not config.AZURE_OPENAI_API_KEY:
@@ -465,18 +492,29 @@ class LLMService:
             yield buf.strip()
 
     def _build_messages(self, user_query: str, history: list, context: List[Dict[str, Any]]) -> list:
-        profile = self._get_customer_profile(1, 1)
+        sess = get_session()
+        cid = int(sess.customer_id) if sess is not None else int(config.DEFAULT_CUSTOMER_ID)
+        hid = int(sess.hotel_id) if sess is not None else int(config.DEFAULT_HOTEL_ID)
+        profile = self._get_customer_profile(cid, hid)
         profile_text = ""
         if profile.get("found"):
             p = profile
-            profile_text = (
-                f"\n\nGuest profile — name: {p.get('name')}, "
-                f"dietary: {p.get('dietary_preferences')}, "
-                f"allergens: {p.get('allergens')}, "
-                f"favourite dishes: {p.get('favorite_dishes')}, "
-                f"visit count: {p.get('visit_count')}, "
-                f"notes: {p.get('notes')}."
-            )
+            nm_stripped = (p.get("name") or "").strip()
+            ag = p.get("age")
+            if not nm_stripped:
+                profile_text = (
+                    "\n\nGuest profile — name not set yet (face enroll). Ask for name and age, "
+                    "then call update_guest_profile."
+                )
+            else:
+                profile_text = (
+                    f"\n\nGuest profile — name: {nm_stripped}, age: {ag}, "
+                    f"dietary: {p.get('dietary_preferences')}, "
+                    f"allergens: {p.get('allergens')}, "
+                    f"favourite dishes: {p.get('favorite_dishes')}, "
+                    f"visit count: {p.get('visit_count')}, "
+                    f"notes: {p.get('notes')}."
+                )
 
         lines = []
         for item in context:
