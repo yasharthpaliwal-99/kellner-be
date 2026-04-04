@@ -84,9 +84,13 @@ class Config:
     DEFAULT_CUSTOMER_ID: int = int(_first_env("DEFAULT_CUSTOMER_ID") or "1")
 
     # CORS allowlist for browser clients (SWA, localhost dev, etc.)
-    CORS_ALLOW_ORIGINS: List[str] = _csv_env_list(
-        "CORS_ALLOW_ORIGINS",
-        "https://nice-ground-03e95fd0f.4.azurestaticapps.net,http://localhost:5173,http://127.0.0.1:5173",
+    _CORS_DEFAULT = (
+        "https://nice-ground-03e95fd0f.4.azurestaticapps.net,"
+        "http://localhost:5173,http://127.0.0.1:5173,"
+        "http://localhost:5175,http://127.0.0.1:5175"
+    )
+    CORS_ALLOW_ORIGINS: List[str] = _csv_env_list("CORS_ALLOW_ORIGINS", _CORS_DEFAULT) + _csv_env_list(
+        "CORS_EXTRA_ORIGINS"
     )
 
     # Local face (InsightFace + pgvector). Optional.

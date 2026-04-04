@@ -28,9 +28,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+# Regex: localhost + private LAN IPs (Vite from phone: http://192.168.x.x:5175).
+# If the SPA is served from the VM public IP (same browser tab as API host), set CORS_EXTRA_ORIGINS
+# e.g. http://74.249.2.119 — Origin is that URL (default http port omitted in header).
+_CORS_DEV_HOST_REGEX = (
+    r"^https?://("
+    r"localhost|127\.0\.0\.1|"
+    r"192\.168\.\d{1,3}\.\d{1,3}|"
+    r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}"
+    r")(:\d+)?$"
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ALLOW_ORIGINS or ["*"],
+    allow_origin_regex=_CORS_DEV_HOST_REGEX,
     allow_methods=["*"],
     allow_headers=["*"],
 )
