@@ -1,6 +1,10 @@
 """
 TTS via Azure OpenAI gpt-4o-mini-tts (audio/speech API).
 Returns raw PCM16 mono at 16 kHz for the WebSocket client.
+
+- synthesize_segment_pcm: short phrases (e.g. filler) — one WAV request each.
+- synthesize_full_turn_pcm: full assistant reply in one prosody (split only past 4096-char API limit).
+
 Barge-in: stop() sets a flag; in-flight HTTP may still finish (short segments).
 """
 from __future__ import annotations
@@ -13,6 +17,27 @@ from array import array
 import requests
 
 from app.config import config
+
+TTS_INPUT_MAX_CHARS = 4096
+
+
+def _split_tts_input(text: str, max_len: int = TTS_INPUT_MAX_CHARS) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+    parts: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= max_len:
+            parts.append(rest)
+            break
+        chunk = rest[:max_len]
+        cut = chunk.rfind(" ")
+        if cut < max_len // 2:
+            cut = max_len
+        parts.append(rest[:cut].strip())
+        rest = rest[cut:].strip()
+    return [p for p in parts if p]
 
 
 def _resample_int16_mono(pcm: bytes, src_hz: int, dst_hz: int = 16000) -> bytes:
@@ -70,7 +95,6 @@ class StreamingTTSService:
             )
         ver = config.AZURE_OPENAI_TTS_API_VERSION
         self._url = f"{endpoint}/openai/deployments/{dep}/audio/speech?api-version={ver}"
-        self._voice = config.AZURE_OPENAI_TTS_VOICE
         self._session = requests.Session()
         self._session.headers.update({"api-key": key})
         self._lock = threading.Lock()
@@ -84,7 +108,26 @@ class StreamingTTSService:
         with self._lock:
             self._cancelled = False
 
-    def synthesize_segment_pcm(self, text: str) -> bytes:
+    def _speech_json_body(self, input_text: str, *, is_filler: bool) -> dict:
+        """Same voice + instruction policy for filler and main (config read each call)."""
+        voice = (config.AZURE_OPENAI_TTS_VOICE or "nova").strip().strip("\"'")
+        inst = (config.AZURE_OPENAI_TTS_INSTRUCTIONS or "").strip()
+        if is_filler:
+            inst = (
+                f"{inst} This is a very short holding phrase; use the same voice and timbre "
+                "as the main assistant reply, not a different character."
+            ).strip()
+        body = {
+            "model": config.AZURE_OPENAI_TTS_DEPLOYMENT,
+            "input": input_text[:TTS_INPUT_MAX_CHARS],
+            "voice": voice,
+            "response_format": "wav",
+        }
+        if inst:
+            body["instructions"] = inst[:4096]
+        return body
+
+    def synthesize_segment_pcm(self, text: str, *, is_filler: bool = False) -> bytes:
         text = (text or "").strip()
         if not text:
             return b""
@@ -93,12 +136,7 @@ class StreamingTTSService:
             if self._cancelled:
                 return b""
 
-        body = {
-            "model": config.AZURE_OPENAI_TTS_DEPLOYMENT,
-            "input": text[:4096],
-            "voice": self._voice,
-            "response_format": "wav",
-        }
+        body = self._speech_json_body(text, is_filler=is_filler)
         try:
             r = self._session.post(
                 self._url,
@@ -120,3 +158,23 @@ class StreamingTTSService:
             return _wav_bytes_to_pcm16_mono_16k(r.content)
         except Exception:
             return b""
+
+    def synthesize_full_turn_pcm(self, text: str) -> bytes:
+        """
+        One neural read per part; parts only if text exceeds the API input limit.
+        Uses the same WAV path as segment synthesis.
+        """
+        pieces = _split_tts_input(text)
+        if not pieces:
+            return b""
+
+        out = bytearray()
+        for part in pieces:
+            with self._lock:
+                if self._cancelled:
+                    break
+            chunk = self.synthesize_segment_pcm(part)
+            if not chunk:
+                break
+            out.extend(chunk)
+        return bytes(out)

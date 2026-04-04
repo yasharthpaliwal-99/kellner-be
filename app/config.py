@@ -4,7 +4,10 @@ from typing import List, Optional
 
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+    # override=True: if AZURE_OPENAI_TTS_VOICE etc. are already set in the shell/IDE,
+    # values from kellner/.env still win (dotenv default would ignore .env for those keys).
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 except ImportError:
     pass
 
@@ -42,7 +45,20 @@ class Config:
     AZURE_OPENAI_TTS_API_KEY: Optional[str] = _first_env("AZURE_OPENAI_TTS_API_KEY")
     AZURE_OPENAI_TTS_DEPLOYMENT: str = _first_env("AZURE_OPENAI_TTS_DEPLOYMENT") or "gpt-4o-mini-tts"
     AZURE_OPENAI_TTS_API_VERSION: str = _first_env("AZURE_OPENAI_TTS_API_VERSION") or "2025-04-01-preview"
-    AZURE_OPENAI_TTS_VOICE: str = _first_env("AZURE_OPENAI_TTS_VOICE") or "nova"
+    # Must be a gpt-4o-mini-tts built-in name (e.g. nova, alloy). Not Azure Speech names like en-US-JennyNeural.
+    AZURE_OPENAI_TTS_VOICE: str = (
+        (_first_env("AZURE_OPENAI_TTS_VOICE") or "nova").strip().strip("\"'")
+    )
+    # Keeps one narrator; gpt-4o-mini-tts may otherwise shift delivery for quotes/dialogue.
+    # Set AZURE_OPENAI_TTS_INSTRUCTIONS= in .env (empty value) to omit the field entirely.
+    AZURE_OPENAI_TTS_INSTRUCTIONS: str = (
+        os.getenv("AZURE_OPENAI_TTS_INSTRUCTIONS", "").strip()
+        if os.getenv("AZURE_OPENAI_TTS_INSTRUCTIONS") is not None
+        else (
+            "Speak in one consistent calm narrator voice for the entire text. "
+            "Do not use different voices or characters for quoted speech or dialogue."
+        )
+    )
 
     AZURE_OPENAI_ENDPOINT: Optional[str] = _first_env("AZURE_OPENAI_ENDPOINT")
     AZURE_OPENAI_API_KEY: Optional[str] = _first_env("AZURE_OPENAI_API_KEY", "LLM_API_KEY")

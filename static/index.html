@@ -482,7 +482,7 @@
       if (i >= 0) activeSources.splice(i, 1);
     };
     src.start(nextPlayTime);
-    nextPlayTime += buffer.duration;
+    nextPlayTime += nSamp / 16000;
   }
 
   function downsampleTo16k(samples, fromRate) {

@@ -81,7 +81,9 @@ async def _run_assistant_turn(
                     "Let me quickly confirm that.",
                 ]
                 phrase = random.choice(phrases)
-                pcm = await asyncio.to_thread(streaming_tts.synthesize_segment_pcm, phrase)
+                pcm = await asyncio.to_thread(
+                    streaming_tts.synthesize_segment_pcm, phrase, is_filler=True
+                )
                 if real_output_started.is_set() or not pcm:
                     return
 
@@ -163,7 +165,8 @@ async def _run_assistant_turn(
     producer_task = asyncio.create_task(llm_producer())
     full_segments: list[str] = []
     t0 = time.perf_counter()
-    first_audio = True
+    first_text_segment = True
+    turn_had_error = False
 
     try:
         while True:
@@ -171,6 +174,7 @@ async def _run_assistant_turn(
             if item is SENTINEL:
                 break
             if isinstance(item, tuple) and item[0] == "__error__":
+                turn_had_error = True
                 await websocket.send_json({
                     "type": "error",
                     "message": item[1],
@@ -181,34 +185,38 @@ async def _run_assistant_turn(
             seg = item
             full_segments.append(seg)
 
-            is_first_segment = first_audio
-            t_tts = time.perf_counter()
-            if is_first_segment:
-                # Real assistant output is starting; stop filler immediately.
+            if first_text_segment:
+                # First LLM chunk arrived; stop filler (we still buffer text until the stream ends).
                 real_output_started.set()
                 if filler_task and not filler_task.done():
                     filler_task.cancel()
-                first_audio = False
+                first_text_segment = False
 
-            pcm = await asyncio.to_thread(streaming_tts.synthesize_segment_pcm, seg)
-            if is_first_segment:
-                print(f"[TIMING] first segment TTS synth: {time.perf_counter() - t_tts:.2f}s (turn {turn_id})")
-                print(f"[TIMING] Total to first segment audio ready: {time.perf_counter() - t0:.2f}s")
-
-            await websocket.send_json({
-                "type": "assistant_text_delta",
-                "text": seg,
-                "turn_id": turn_id,
-            })
-
-            chunk_size = 4096
-            for i in range(0, len(pcm), chunk_size):
-                chunk = pcm[i : i + chunk_size]
+        # Full reply first: one text message, then one TTS pass (stable voice for short answers).
+        if not turn_had_error and full_segments:
+            full_text = " ".join(full_segments).strip()
+            if full_text:
                 await websocket.send_json({
-                    "type": "audio_delta",
+                    "type": "assistant_text_delta",
+                    "text": full_text,
                     "turn_id": turn_id,
-                    "b64": base64.b64encode(chunk).decode("ascii"),
                 })
+                t_tts = time.perf_counter()
+                pcm = await asyncio.to_thread(streaming_tts.synthesize_full_turn_pcm, full_text)
+                print(
+                    f"[TIMING] full-turn TTS synth: {time.perf_counter() - t_tts:.2f}s "
+                    f"(turn {turn_id}, {len(full_text)} chars)"
+                )
+                print(f"[TIMING] Total to first audio ready: {time.perf_counter() - t0:.2f}s")
+
+                chunk_size = 4096
+                for i in range(0, len(pcm), chunk_size):
+                    chunk = pcm[i : i + chunk_size]
+                    await websocket.send_json({
+                        "type": "audio_delta",
+                        "turn_id": turn_id,
+                        "b64": base64.b64encode(chunk).decode("ascii"),
+                    })
     except asyncio.CancelledError:
         streaming_tts.stop()
         producer_task.cancel()

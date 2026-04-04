@@ -41,7 +41,12 @@ def test_openai_tts() -> bool:
         if len(pcm) < 200:
             print("FAIL OpenAI TTS: empty or tiny PCM response")
             return False
-        print(f"OK   Azure OpenAI TTS ({len(pcm)} PCM bytes @ 16k mono)")
+        print(f"OK   Azure OpenAI TTS segment ({len(pcm)} PCM bytes @ 16k mono)")
+        pcm2 = tts.synthesize_full_turn_pcm("First sentence. Second sentence.")
+        if len(pcm2) < 200:
+            print("FAIL OpenAI TTS: full-turn synthesis empty or tiny")
+            return False
+        print(f"OK   Azure OpenAI TTS full-turn ({len(pcm2)} PCM bytes @ 16k mono)")
         return True
     except Exception as e:
         print(f"FAIL OpenAI TTS: {e}")
