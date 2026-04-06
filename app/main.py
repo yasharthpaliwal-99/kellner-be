@@ -1,9 +1,8 @@
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import JSONResponse
 
 from app.api.conversation import router as conversation_router
 from app.api.device_auth import router as device_auth_router
@@ -54,10 +53,9 @@ app.include_router(device_auth_router, prefix="/api")
 app.include_router(face_local_router, prefix="/api")
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    html_path = Path(__file__).resolve().parent.parent / "static" / "index.html"
-    return HTMLResponse(content=html_path.read_text())
+@app.get("/")
+async def root():
+    return JSONResponse({"service": "kellner", "health": "/health", "docs": "/docs"})
 
 
 @app.get("/health")
