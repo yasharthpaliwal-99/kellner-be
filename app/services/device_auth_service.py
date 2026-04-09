@@ -59,6 +59,63 @@ def ensure_device_auth_indexes() -> None:
         sessions.create_index([("hotel_id", 1), ("role", 1)], name="hotel_role")
 
 
+def normalize_agent_language(raw: Any) -> str:
+    """Hotel DB values → en | hinglish (default en). Legacy hi/hindi map to hinglish."""
+    s = str(raw or "").strip().lower().replace("_", "-")
+    if not s:
+        return "en"
+    if s in ("hinglish", "hing", "hi-en", "hindi-english", "hing-lish"):
+        return "hinglish"
+    if s in ("hi", "hin", "hindi", "hi-in"):
+        return "hinglish"
+    if s.startswith("hi-"):
+        return "hinglish"
+    if s in ("en", "eng", "english", "en-in", "en-us", "en-gb"):
+        return "en"
+    if s.startswith("en-"):
+        return "en"
+    return "en"
+
+
+def agent_language_from_hotel_doc(hotel: Optional[Dict[str, Any]]) -> str:
+    """
+    Same `hotels` document as login credentials (`password_hash`, `hotel_id`, …).
+    Add **`agent_language`**: `"en"` or `"hinglish"` there (`hi`/`hindi` are treated as hinglish).
+    At login we already load this doc for password check; language is read from it once.
+    Older docs: falls back to `language`, `locale`, `preferred_language` if needed.
+    """
+    if not hotel:
+        return "en"
+    for key in ("agent_language", "language", "locale", "preferred_language"):
+        v = hotel.get(key)
+        if v is not None and str(v).strip():
+            return normalize_agent_language(v)
+    return "en"
+
+
+def _agent_language_from_hotel_id(hotel_id: Any) -> str:
+    """Mongo round-trip only when session doc has no agent_language yet (legacy)."""
+    hotels = _hotels_collection()
+    if hotels is None:
+        return "en"
+    variants = _hotel_id_variants(hotel_id)
+    if not variants:
+        return "en"
+    hotel = hotels.find_one({"hotel_id": {"$in": variants}})
+    return agent_language_from_hotel_doc(hotel)
+
+
+def agent_language_for_session(doc: Optional[Dict[str, Any]]) -> str:
+    """
+    Copy of hotel `agent_language` written at login onto `device_sessions`.
+    WebSocket only sends `session_id` (not password), so language lives on the session
+    snapshot — no “passing through” handlers; just read this field after validate.
+    """
+    if not doc:
+        return "en"
+    return normalize_agent_language(doc.get("agent_language"))
+
+
 def _hotel_id_variants(hotel_id: Any) -> list[Any]:
     raw = str(hotel_id).strip()
     if not raw:
@@ -103,6 +160,8 @@ def login_hotel_device(
 
     sid = secrets.token_urlsafe(32)
     now = _utcnow()
+    # Same `hotel` dict as credential check — read language here, persist on session for WS.
+    agent_lang = agent_language_from_hotel_doc(hotel)
     sess = {
         "session_id": sid,
         "hotel_id": hotel.get("hotel_id"),
@@ -112,6 +171,7 @@ def login_hotel_device(
         "revoked": False,
         "created_at": now,
         "last_seen_at": now,
+        "agent_language": agent_lang,
     }
     sessions.insert_one(sess)
     return sess, None
@@ -129,5 +189,12 @@ def validate_device_session(session_id: str, role: Optional[str] = None) -> Tupl
         return None, "Invalid device session."
     if role and str(doc.get("role") or "") != role:
         return None, "Session role mismatch."
-    sessions.update_one({"_id": doc["_id"]}, {"$set": {"last_seen_at": _utcnow()}})
-    return doc, None
+    now = _utcnow()
+    to_set: Dict[str, Any] = {"last_seen_at": now}
+    raw_lang = doc.get("agent_language")
+    if raw_lang is None or not str(raw_lang).strip():
+        to_set["agent_language"] = _agent_language_from_hotel_id(doc.get("hotel_id"))
+    sessions.update_one({"_id": doc["_id"]}, {"$set": to_set})
+    merged = dict(doc)
+    merged.update(to_set)
+    return merged, None

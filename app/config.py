@@ -33,12 +33,11 @@ class Config:
     Speech:   AZURE_SPEECH_KEY, AZURE_SPEECH_REGION
     Reasoning: AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT_NAME
 
-    Optional: AZURE_OPENAI_API_VERSION, AZURE_TTS_VOICE_NAME
+    Optional: AZURE_OPENAI_API_VERSION
     """
 
     AZURE_SPEECH_KEY: Optional[str] = _first_env("AZURE_SPEECH_KEY", "STT_API_KEY", "TTS_API_KEY")
     AZURE_SPEECH_REGION: Optional[str] = _first_env("AZURE_SPEECH_REGION", "AZURE_REGION")
-    AZURE_TTS_VOICE_NAME: str = _first_env("AZURE_TTS_VOICE_NAME") or "en-US-JennyNeural"
 
     # Azure OpenAI audio (gpt-4o-mini-tts) — separate from chat if needed
     AZURE_OPENAI_TTS_ENDPOINT: Optional[str] = _first_env("AZURE_OPENAI_TTS_ENDPOINT")
@@ -83,9 +82,8 @@ class Config:
     DEFAULT_HOTEL_ID: int = int(_first_env("DEFAULT_HOTEL_ID") or "1")
     DEFAULT_CUSTOMER_ID: int = int(_first_env("DEFAULT_CUSTOMER_ID") or "1")
 
-    # CORS allowlist for browser clients (SWA, localhost dev, etc.)
+    # CORS allowlist for browser clients (localhost dev, etc.)
     _CORS_DEFAULT = (
-        "https://nice-ground-03e95fd0f.4.azurestaticapps.net,"
         "http://localhost:5173,http://127.0.0.1:5173,"
         "http://localhost:5175,http://127.0.0.1:5175"
     )

@@ -35,12 +35,6 @@ def get_orders_collection() -> Optional["Collection[Any]"]:
     return db[config.MONGODB_ORDERS_COLLECTION]
 
 
-def orders_collection_full_name() -> Optional[str]:
-    """Safe string for logging; use `c is not None`, never `if c` — PyMongo Collection has no __bool__."""
-    c = get_orders_collection()
-    return c.full_name if c is not None else None
-
-
 def ensure_order_indexes() -> None:
     col = get_orders_collection()
     if col is None:

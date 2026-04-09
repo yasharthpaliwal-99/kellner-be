@@ -6,7 +6,11 @@ from typing import Any, Literal, Optional
 from fastapi import APIRouter, HTTPException, Header
 from pydantic import BaseModel, Field
 
-from app.services.device_auth_service import login_hotel_device, validate_device_session
+from app.services.device_auth_service import (
+    agent_language_for_session,
+    login_hotel_device,
+    validate_device_session,
+)
 
 router = APIRouter()
 
@@ -39,6 +43,7 @@ def device_login(payload: DeviceLoginRequest):
         "role": sess["role"],
         "table_number": sess.get("table_number"),
         "device_id": sess.get("device_id"),
+        "agent_language": sess.get("agent_language") or "en",
     }
 
 
@@ -53,4 +58,5 @@ def device_session(x_device_session: str = Header(...)):
         "role": sess.get("role"),
         "table_number": sess.get("table_number"),
         "device_id": sess.get("device_id"),
+        "agent_language": agent_language_for_session(sess),
     }

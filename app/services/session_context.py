@@ -12,6 +12,8 @@ class ConversationSession:
     hotel_id: int
     customer_id: int
     order_id: Optional[str] = None  # Mongo ObjectId hex string after first place_order
+    # Mongo `hotels` doc: agent_language | … → "en" | "hinglish" (legacy hi/hindi → hinglish)
+    agent_language: str = "en"
 
 
 _session_var: ContextVar[Optional[ConversationSession]] = ContextVar(

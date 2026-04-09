@@ -2,8 +2,9 @@
 TTS via Azure OpenAI gpt-4o-mini-tts (audio/speech API).
 Returns raw PCM16 mono at 16 kHz for the WebSocket client.
 
-- synthesize_segment_pcm: short phrases (e.g. filler) — one WAV request each.
-- synthesize_full_turn_pcm: full assistant reply in one prosody (split only past 4096-char API limit).
+- synthesize_segment_pcm: one WAV request (used internally for each split part).
+- synthesize_full_turn_pcm: full text in one prosody path (split only past 4096-char API limit);
+  same segment loop as short lines — use is_filler=True for holding phrases.
 
 Barge-in: stop() sets a flag; in-flight HTTP may still finish (short segments).
 """
@@ -108,10 +109,18 @@ class StreamingTTSService:
         with self._lock:
             self._cancelled = False
 
-    def _speech_json_body(self, input_text: str, *, is_filler: bool) -> dict:
+    def _speech_json_body(
+        self, input_text: str, *, is_filler: bool, agent_language: str = "en"
+    ) -> dict:
         """Same voice + instruction policy for filler and main (config read each call)."""
         voice = (config.AZURE_OPENAI_TTS_VOICE or "nova").strip().strip("\"'")
         inst = (config.AZURE_OPENAI_TTS_INSTRUCTIONS or "").strip()
+        lang = (agent_language or "en").lower()
+        if lang in ("hinglish", "hi", "hindi"):
+            inst = (
+                f"{inst} Speak in natural Indian Hinglish: Hindi–English code-mix with clear, "
+                "authentic Indian pronunciation (not formal textbook Hindi only)."
+            ).strip()
         if is_filler:
             inst = (
                 f"{inst} This is a very short holding phrase; use the same voice and timbre "
@@ -127,7 +136,9 @@ class StreamingTTSService:
             body["instructions"] = inst[:4096]
         return body
 
-    def synthesize_segment_pcm(self, text: str, *, is_filler: bool = False) -> bytes:
+    def synthesize_segment_pcm(
+        self, text: str, *, is_filler: bool = False, agent_language: str = "en"
+    ) -> bytes:
         text = (text or "").strip()
         if not text:
             return b""
@@ -136,7 +147,9 @@ class StreamingTTSService:
             if self._cancelled:
                 return b""
 
-        body = self._speech_json_body(text, is_filler=is_filler)
+        body = self._speech_json_body(
+            text, is_filler=is_filler, agent_language=agent_language
+        )
         try:
             r = self._session.post(
                 self._url,
@@ -159,10 +172,16 @@ class StreamingTTSService:
         except Exception:
             return b""
 
-    def synthesize_full_turn_pcm(self, text: str) -> bytes:
+    def synthesize_full_turn_pcm(
+        self,
+        text: str,
+        *,
+        agent_language: str = "en",
+        is_filler: bool = False,
+    ) -> bytes:
         """
         One neural read per part; parts only if text exceeds the API input limit.
-        Uses the same WAV path as segment synthesis.
+        Same loop as segment synthesis (WAV → PCM16 mono 16 kHz).
         """
         pieces = _split_tts_input(text)
         if not pieces:
@@ -173,7 +192,9 @@ class StreamingTTSService:
             with self._lock:
                 if self._cancelled:
                     break
-            chunk = self.synthesize_segment_pcm(part)
+            chunk = self.synthesize_segment_pcm(
+                part, is_filler=is_filler, agent_language=agent_language
+            )
             if not chunk:
                 break
             out.extend(chunk)
