@@ -340,6 +340,8 @@ class LLMService:
         self._executor = ToolExecutor()
 
     def _get_customer_profile(self, customer_id: int, hotel_id: int) -> dict:
+        if customer_id <= 0:
+            return {"found": False}
         key = (customer_id, hotel_id)
         if key not in LLMService._customer_cache:
             raw = self._executor.run(
@@ -608,6 +610,11 @@ class LLMService:
                     f"visit count: {p.get('visit_count')}, "
                     f"notes: {p.get('notes')}."
                 )
+        elif cid <= 0:
+            profile_text = (
+                "\n\n**Guest identity:** No customer profile is linked to this session (anonymous). "
+                "Do not greet by name or assume a returning guest until they identify or enroll."
+            )
 
         lines = []
         for item in context:

@@ -78,6 +78,9 @@ class Config:
     MONGODB_DB_NAME: str = _first_env("MONGODB_DB_NAME", "DATABASE_NAME") or "kellner"
     MONGODB_ORDERS_COLLECTION: str = _first_env("MONGODB_ORDERS_COLLECTION") or "orders"
 
+    # Optional override for proactive `guest_greeting` WebSocket turn (empty = use per-language defaults in code).
+    GUEST_GREETING_PROMPT: Optional[str] = _first_env("GUEST_GREETING_PROMPT")
+
     # Default tenant / guest for voice session until auth exists
     DEFAULT_HOTEL_ID: int = int(_first_env("DEFAULT_HOTEL_ID") or "1")
     DEFAULT_CUSTOMER_ID: int = int(_first_env("DEFAULT_CUSTOMER_ID") or "1")

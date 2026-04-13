@@ -7,7 +7,6 @@ import random
 import tempfile
 import time
 import uuid
-from functools import partial
 from typing import List, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -52,6 +51,7 @@ def _complete_sentences_within_budget(text: str, max_words: int) -> str:
             boundaries.append(i)
     if not boundaries:
         return ""
+    best = ""
     for end in boundaries:
         candidate = text[: end + 1].strip()
         if len(candidate.split()) <= max_words:
@@ -67,6 +67,29 @@ def _complete_sentences_within_budget(text: str, max_words: int) -> str:
 
 
 logger = logging.getLogger(__name__)
+
+# Synthetic user message for LLM on `guest_greeting` (Call waiter / proactive welcome). Not shown as user text when source=guest_greeting.
+_GUEST_GREETING_EN = (
+    "The guest has just started a voice session. Greet them warmly in one or two short sentences, "
+    "introduce yourself as the hotel assistant, and offer help with the menu, ordering, or room service. "
+    "Do not ask them to repeat anything; keep it natural and welcoming."
+)
+_GUEST_GREETING_HINGLISH = (
+    "Guest abhi voice session shuru kiya hai. Unhe warmly greet karo — ek ya do short sentences mein, "
+    "khud ko hotel assistant batao, aur menu, order ya room service mein help offer karo. "
+    "Natural Indian Hinglish mein bolo. Kuch repeat karne ko mat kaho."
+)
+
+
+def _guest_greeting_prompt(agent_language: str) -> str:
+    custom = (config.GUEST_GREETING_PROMPT or "").strip()
+    if custom:
+        return custom
+    lang = (agent_language or "en").lower()
+    if lang == "hinglish":
+        return _GUEST_GREETING_HINGLISH
+    return _GUEST_GREETING_EN
+
 
 retrieval_service = RetrievalService()
 llm_service = LLMService()
@@ -131,6 +154,60 @@ async def _send_pcm_audio_deltas(websocket: WebSocket, pcm: bytes, turn_id: int)
         })
 
 
+_TTS_STREAM_END = object()
+
+
+async def _stream_tts_http_to_websocket(
+    websocket: WebSocket,
+    turn_id: int,
+    text: str,
+    *,
+    agent_language: str,
+    is_filler: bool,
+    tts: StreamingTTSService,
+    first_audio_perf: Optional[list] = None,
+    cancel_if_event: Optional[asyncio.Event] = None,
+) -> None:
+    """Read TTS HTTP body in a worker thread; forward 16 kHz PCM to WebSocket as it arrives."""
+    text = (text or "").strip()
+    if not text:
+        return
+    loop = asyncio.get_running_loop()
+    q: asyncio.Queue = asyncio.Queue(maxsize=64)
+
+    def worker() -> None:
+        try:
+            for pcm_chunk in tts.iter_pcm16_chunks_from_http_stream(
+                text, agent_language=agent_language, is_filler=is_filler
+            ):
+                fut = asyncio.run_coroutine_threadsafe(q.put(pcm_chunk), loop)
+                fut.result(timeout=180)
+        except Exception as e:
+            logger.exception("tts_stream_worker_failed: %s", e)
+        finally:
+            try:
+                asyncio.run_coroutine_threadsafe(q.put(_TTS_STREAM_END), loop).result(timeout=15)
+            except Exception:
+                pass
+
+    worker_task = asyncio.create_task(asyncio.to_thread(worker))
+    try:
+        while True:
+            item = await q.get()
+            if item is _TTS_STREAM_END:
+                break
+            if cancel_if_event is not None and cancel_if_event.is_set():
+                tts.stop()
+                break
+            if tts.is_stopped():
+                break
+            if first_audio_perf is not None and first_audio_perf[0] is None:
+                first_audio_perf[0] = time.perf_counter()
+            await _send_pcm_audio_deltas(websocket, item, turn_id)
+    finally:
+        await worker_task
+
+
 async def _send_show_and_structured(
     websocket: WebSocket,
     mode: str,
@@ -178,9 +255,13 @@ async def _run_assistant_turn(
     enable_filler: bool = True,
     *,
     stt_seconds: Optional[float] = None,
+    proactive_source: Optional[str] = None,
 ) -> None:
     if not transcript.strip():
         return
+
+    # For proactive turns, transcript is the LLM instruction; history uses a short stub instead of the full prompt.
+    user_history_stub = transcript if not proactive_source else "(Guest session)"
 
     transaction_id = str(uuid.uuid4())
     t_turn_start = time.perf_counter()
@@ -199,11 +280,14 @@ async def _run_assistant_turn(
 
     streaming_tts.reset_for_new_turn()
 
-    await websocket.send_json({
+    _tr_payload: dict = {
         "type": "transcript",
-        "text": transcript,
+        "text": "" if proactive_source else transcript,
         "turn_id": turn_id,
-    })
+    }
+    if proactive_source:
+        _tr_payload["source"] = proactive_source
+    await websocket.send_json(_tr_payload)
 
     # UX filler: optional single generic line while tools + LLM run.
     # Filler must NOT be added to `full_segments/history`.
@@ -221,15 +305,7 @@ async def _run_assistant_turn(
                     lang = "en"
                 phrases = FILLERS_HINGLISH if lang == "hinglish" else FILLERS_EN
                 phrase = random.choice(phrases)
-                pcm = await asyncio.to_thread(
-                    partial(
-                        streaming_tts.synthesize_full_turn_pcm,
-                        phrase,
-                        agent_language=lang,
-                        is_filler=True,
-                    )
-                )
-                if real_output_started.is_set() or not pcm:
+                if real_output_started.is_set():
                     return
 
                 await websocket.send_json({
@@ -238,10 +314,20 @@ async def _run_assistant_turn(
                     "turn_id": turn_id,
                 })
 
-                await _send_pcm_audio_deltas(websocket, pcm, turn_id)
+                await _stream_tts_http_to_websocket(
+                    websocket,
+                    turn_id,
+                    phrase,
+                    agent_language=lang,
+                    is_filler=True,
+                    tts=streaming_tts,
+                    cancel_if_event=real_output_started,
+                )
 
             except asyncio.CancelledError:
-                # Do not call streaming_tts.stop() here: it would cancel real narration.
+                # Release streaming HTTP lock so main-line TTS can run; interrupt uses stop() elsewhere.
+                streaming_tts.stop()
+                streaming_tts.reset_for_new_turn()
                 return
 
         filler_task = asyncio.create_task(_filler_controller())
@@ -305,18 +391,19 @@ async def _run_assistant_turn(
             if not spoken:
                 return
             tt0 = time.perf_counter()
-            pcm = await asyncio.to_thread(
-                partial(
-                    streaming_tts.synthesize_full_turn_pcm,
-                    spoken,
-                    agent_language=lang,
-                    is_filler=False,
-                )
+            first_audio_ref: list = [None]
+            await _stream_tts_http_to_websocket(
+                websocket,
+                turn_id,
+                spoken,
+                agent_language=lang,
+                is_filler=False,
+                tts=streaming_tts,
+                first_audio_perf=first_audio_ref,
             )
             tts_seconds = time.perf_counter() - tt0
-            if pcm:
-                first_audio_seconds = time.perf_counter() - t_turn_start
-            await _send_pcm_audio_deltas(websocket, pcm, turn_id)
+            if first_audio_ref[0] is not None:
+                first_audio_seconds = first_audio_ref[0] - t_turn_start
 
         # Tagged reply from tool phase (rare; no format appendix was applied).
         if direct is not None:
@@ -344,7 +431,7 @@ async def _run_assistant_turn(
                 if speak_line:
                     await _phase2_tts_from_plain(speak_line)
                 assistant_history_text = history_after_show(True, sh0, direct, pl_direct)
-                history.append({"role": "user", "content": transcript})
+                history.append({"role": "user", "content": user_history_stub})
                 history.append({"role": "assistant", "content": assistant_history_text})
                 if len(history) > 20:
                     history = history[-20:]
@@ -415,7 +502,7 @@ async def _run_assistant_turn(
                         await _phase2_tts_from_plain(" ".join(full_segments))
                     assistant_history_text = assistant_history_content(False, None, full_raw)
                 if assistant_history_text and not turn_had_error:
-                    history.append({"role": "user", "content": transcript})
+                    history.append({"role": "user", "content": user_history_stub})
                     history.append({"role": "assistant", "content": assistant_history_text})
                     if len(history) > 20:
                         history = history[-20:]
@@ -501,7 +588,7 @@ async def _run_assistant_turn(
             await _phase2_tts_from_plain(" ".join(full_segments))
 
         if full_segments:
-            history.append({"role": "user", "content": transcript})
+            history.append({"role": "user", "content": user_history_stub})
             history.append({"role": "assistant", "content": " ".join(full_segments)})
             if len(history) > 20:
                 history = history[-20:]
@@ -590,13 +677,16 @@ async def ws_conversation(websocket: WebSocket):
     Voice session:
       - Continuous PCM16 16kHz mono (binary frames) → STT segments on silence (SDK).
       - Optional `{"type":"interrupt"}` → stop TTS + cancel in-flight assistant turn.
+      - `{"type":"guest_greeting"}` (after `voice_session`, e.g. Call waiter) → proactive welcome turn (LLM + TTS).
       - Legacy: single binary WAV (RIFF…) → batch STT.
 
     Server → client:
       transcript, recommendations (optional, after menu search), assistant_text_delta,
       assistant_reply_mode (optional: bill | order_confirmation | recommendations — sent once
       before structured assistant output for that turn), assistant_structured (optional JSON
-      payload when SHOW parses), audio_delta (raw PCM base64), done, error (turn_id where relevant).
+      payload when SHOW parses), audio_delta (PCM16 mono **16 kHz** base64; chunks arrive as
+      Azure TTS HTTP stream is read, not after a full-buffer wait), done, error (turn_id where relevant).
+      transcript may include `"source":"guest_greeting"` with empty `text` for proactive welcome turns.
     """
     sid = (websocket.query_params.get("session_id") or "").strip()
     sess_doc, sess_err = validate_device_session(sid, role="device")
@@ -606,7 +696,9 @@ async def ws_conversation(websocket: WebSocket):
 
     await websocket.accept()
     hid = int(sess_doc.get("hotel_id") or config.DEFAULT_HOTEL_ID)
-    customer_id = int(config.DEFAULT_CUSTOMER_ID)
+    # No customer_id on the socket = anonymous guest — do not fall back to DEFAULT_CUSTOMER_ID
+    # (that points at seeded rows like customer_id=1 "Aarav" and wrongly personalises the agent).
+    customer_id = 0
     cid_raw = (websocket.query_params.get("customer_id") or "").strip()
     if cid_raw:
         try:
@@ -678,6 +770,24 @@ async def ws_conversation(websocket: WebSocket):
                 if data.get("type") == "interrupt":
                     await cancel_assistant()
                     await websocket.send_json({"type": "interrupted", "turn_id": turn_seq})
+                    continue
+                if data.get("type") == "guest_greeting":
+                    await cancel_assistant()
+                    turn_seq += 1
+                    tid = turn_seq
+                    greet_prompt = _guest_greeting_prompt(conv_session.agent_language)
+                    assistant_task = asyncio.create_task(
+                        _run_assistant_turn(
+                            websocket,
+                            history,
+                            greet_prompt,
+                            tid,
+                            conv_session,
+                            enable_filler=True,
+                            proactive_source="guest_greeting",
+                        )
+                    )
+                    assistant_task.add_done_callback(_log_assistant_task)
                     continue
                 if data.get("type") == "voice_session":
                     if stt is None:

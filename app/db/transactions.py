@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
+import psycopg2
 from psycopg2.extras import Json
 
 from app.db.pool import get_pool
@@ -48,8 +49,10 @@ def insert_transaction_row(row: Dict[str, Any]) -> None:
     except ValueError:
         logger.debug("transactions: PostgreSQL not configured, skip")
         return
-    conn = pool.getconn()
+    conn = None
+    discard_conn = False
     try:
+        conn = pool.getconn()
         params = dict(row)
         params["events"] = Json(params.get("events") or [])
         with conn.cursor() as cur:
@@ -73,7 +76,19 @@ def insert_transaction_row(row: Dict[str, Any]) -> None:
             )
         conn.commit()
     except Exception as exc:
-        conn.rollback()
+        if isinstance(exc, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+            discard_conn = True
+        try:
+            if conn is not None and getattr(conn, "closed", 1) == 0:
+                conn.rollback()
+        except Exception:
+            discard_conn = True
+        if conn is not None and getattr(conn, "closed", 0) != 0:
+            discard_conn = True
         logger.warning("transactions: insert failed: %s", exc)
     finally:
-        pool.putconn(conn)
+        if conn is not None:
+            try:
+                pool.putconn(conn, close=discard_conn)
+            except Exception:
+                logger.debug("transactions: putconn failed", exc_info=True)

@@ -131,8 +131,16 @@ class ToolExecutor:
     def _tool_find_user_preference(self, args: Dict[str, Any]) -> str:
         customer_id = args.get("customer_id")
         hotel_id = args.get("hotel_id")
-        if not customer_id or not hotel_id:
-            return _dumps({"error": "Both customer_id and hotel_id are required."})
+        if not hotel_id:
+            return _dumps({"error": "hotel_id is required."})
+        try:
+            cid = int(customer_id) if customer_id is not None else 0
+        except (TypeError, ValueError):
+            cid = 0
+        if cid <= 0:
+            return _dumps(
+                {"found": False, "message": "No guest profile (anonymous session or missing customer_id)."}
+            )
 
         pool = get_pool()
         conn = pool.getconn()
@@ -147,7 +155,7 @@ class ToolExecutor:
                     WHERE customer_id = %s AND hotel_id = %s
                     LIMIT 1
                     """,
-                    (customer_id, hotel_id),
+                    (cid, hotel_id),
                 )
                 row = cur.fetchone()
 
