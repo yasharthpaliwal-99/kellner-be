@@ -11,10 +11,14 @@ from typing import Any, Dict
 from app.db.pool import get_pool
 from app.services.embedding_service import embed
 from app.services.order_service import get_current_order_snapshot
+from app.services.order_service import get_bill_breakdown as persist_get_bill_breakdown
+from app.services.order_service import get_proactive_checklist as persist_get_proactive_checklist
 from app.services.order_service import bring_the_bill as persist_bring_the_bill
+from app.services.order_service import mark_rating_asked as persist_mark_rating_asked
 from app.services.order_service import modify_order as persist_modify_order
 from app.services.order_service import place_order as persist_place_order
 from app.services.order_service import review_and_feedback as persist_review_and_feedback
+from app.services.order_service import update_proactive_checklist as persist_update_proactive_checklist
 from app.services.face_local_service import update_guest_profile
 from app.services.session_context import get_session
 
@@ -55,7 +59,7 @@ class ToolExecutor:
                 if sess is not None:
                     cur.execute(
                         """
-                        SELECT name, cuisine_type, description, price, ingredients, allergens
+                        SELECT name, cuisine_type, description, price, ingredients, allergens, image
                         FROM menu_items
                         WHERE available = true AND hotel_id = %s
                         ORDER BY embedding <=> %s::vector
@@ -66,7 +70,7 @@ class ToolExecutor:
                 else:
                     cur.execute(
                         """
-                        SELECT name, cuisine_type, description, price, ingredients, allergens
+                        SELECT name, cuisine_type, description, price, ingredients, allergens, image
                         FROM menu_items
                         WHERE available = true
                         ORDER BY embedding <=> %s::vector
@@ -83,6 +87,7 @@ class ToolExecutor:
                     "price": float(r[3]) if r[3] is not None else None,
                     "ingredients": r[4],
                     "allergens": r[5],
+                    "image": r[6],
                 }
                 for r in rows
             ]
@@ -230,6 +235,39 @@ class ToolExecutor:
         if oid is not None:
             oid = str(oid).strip() or None
         result = persist_bring_the_bill(order_id=oid)
+        return _dumps(result)
+
+    def _tool_get_bill_breakdown(self, args: Dict[str, Any]) -> str:
+        oid = args.get("order_id")
+        if oid is not None:
+            oid = str(oid).strip() or None
+        result = persist_get_bill_breakdown(order_id=oid)
+        return _dumps(result)
+
+    def _tool_get_proactive_checklist(self, args: Dict[str, Any]) -> str:
+        oid = args.get("order_id")
+        if oid is not None:
+            oid = str(oid).strip() or None
+        result = persist_get_proactive_checklist(order_id=oid)
+        return _dumps(result)
+
+    def _tool_update_proactive_checklist(self, args: Dict[str, Any]) -> str:
+        oid = args.get("order_id")
+        if oid is not None:
+            oid = str(oid).strip() or None
+        result = persist_update_proactive_checklist(
+            sweets_suggested=args.get("sweets_suggested"),
+            drinks_suggested=args.get("drinks_suggested"),
+            others_suggested=args.get("others_suggested"),
+            order_id=oid,
+        )
+        return _dumps(result)
+
+    def _tool_mark_rating_asked(self, args: Dict[str, Any]) -> str:
+        oid = args.get("order_id")
+        if oid is not None:
+            oid = str(oid).strip() or None
+        result = persist_mark_rating_asked(order_id=oid)
         return _dumps(result)
 
     def _tool_modify_order(self, args: Dict[str, Any]) -> str:

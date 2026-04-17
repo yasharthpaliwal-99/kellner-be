@@ -25,7 +25,7 @@ def fetch_menu_rows(hotel_id: int) -> List[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT dish_id, name, price, available
+                SELECT dish_id, name, price, available, image
                 FROM menu_items
                 WHERE hotel_id = %s
                 ORDER BY dish_id ASC
@@ -44,6 +44,7 @@ def fetch_menu_rows(hotel_id: int) -> List[Dict[str, Any]]:
                     "name": r[1],
                     "price": price,
                     "available": bool(r[3]),
+                    "image": r[4],
                 }
             )
         return out
@@ -97,4 +98,43 @@ def apply_availability_updates(
         raise
     finally:
         conn.autocommit = True
+        pool.putconn(conn)
+
+
+def update_menu_image_url(hotel_id: int, dish_id: int, image_url: str) -> Dict[str, Any] | None:
+    """
+    Update menu_items.image for a specific dish scoped to the hotel.
+    Returns updated row summary or None if dish not found for hotel.
+    """
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE menu_items
+                SET image = %s
+                WHERE dish_id = %s AND hotel_id = %s
+                RETURNING dish_id, name, price, available, image
+                """,
+                (image_url, dish_id, hotel_id),
+            )
+            row = cur.fetchone()
+        conn.commit()
+        if row is None:
+            return None
+        price = row[2]
+        if price is not None and isinstance(price, Decimal):
+            price = float(price)
+        return {
+            "dish_id": int(row[0]),
+            "name": row[1],
+            "price": price,
+            "available": bool(row[3]),
+            "image": row[4],
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
         pool.putconn(conn)

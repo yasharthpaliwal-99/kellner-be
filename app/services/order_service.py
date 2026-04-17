@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from bson import ObjectId
 from bson.errors import InvalidId
 
+from app.config import config
 from app.db.mongo import get_orders_collection
 from app.db.pool import get_pool
 from app.services.session_context import get_session
@@ -40,6 +41,36 @@ def _normalize_order_status(raw: Optional[str]) -> Optional[str]:
 
 def _recalc_subtotal(lines: List[Dict[str, Any]]) -> float:
     return round(sum(float(x.get("line_total") or 0) for x in lines), 2)
+
+
+def _round2(v: float) -> float:
+    return round(float(v or 0), 2)
+
+
+def _default_proactive_state() -> Dict[str, Any]:
+    return {
+        "checklist": {
+            "sweets_suggested": False,
+            "drinks_suggested": False,
+            "others_suggested": False,
+        },
+        "rating_asked_at": None,
+        "rating_received_at": None,
+    }
+
+
+def _normalize_proactive_state(raw: Any) -> Dict[str, Any]:
+    state = _default_proactive_state()
+    if not isinstance(raw, dict):
+        return state
+    cl = raw.get("checklist")
+    if isinstance(cl, dict):
+        for k in state["checklist"].keys():
+            if k in cl:
+                state["checklist"][k] = bool(cl.get(k))
+    state["rating_asked_at"] = raw.get("rating_asked_at")
+    state["rating_received_at"] = raw.get("rating_received_at")
+    return state
 
 
 def _load_order_for_session(
@@ -182,6 +213,7 @@ def get_current_order_snapshot(order_id: Optional[str] = None) -> Dict[str, Any]
     if err or not doc:
         return {"ok": False, "error": err or "No order found."}
     rev = doc.get("review") or {}
+    proactive = _normalize_proactive_state(doc.get("proactive"))
     return {
         "ok": True,
         "order_id": str(doc["_id"]),
@@ -195,6 +227,57 @@ def get_current_order_snapshot(order_id: Optional[str] = None) -> Dict[str, Any]
             or (rev.get("feedback_text") or "").strip()
             or (rev.get("item_ratings") or [])
         ),
+        "proactive": proactive,
+    }
+
+
+def get_bill_breakdown(order_id: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Compute a deterministic bill payload from current order lines.
+    Includes subtotal, service charge, GST, and grand total.
+    """
+    snap = get_current_order_snapshot(order_id=order_id)
+    if not snap.get("ok"):
+        return snap
+
+    lines = snap.get("line_items") or []
+    out_items: List[Dict[str, Any]] = []
+    subtotal = 0.0
+    for li in lines:
+        name = str(li.get("name") or "").strip()
+        if not name:
+            continue
+        qty = int(li.get("quantity") or 0)
+        unit = _round2(li.get("unit_price") or 0)
+        line_total = _round2(li.get("line_total") or (unit * qty))
+        subtotal = _round2(subtotal + line_total)
+        out_items.append(
+            {
+                "name": name,
+                "quantity": qty,
+                "unit_price": unit,
+                "line_total": line_total,
+            }
+        )
+
+    service_charge_percent = _round2(config.BILL_SERVICE_CHARGE_PERCENT)
+    gst_percent = _round2(config.BILL_GST_PERCENT)
+    service_charge_amount = _round2(subtotal * service_charge_percent / 100.0)
+    taxable_amount = _round2(subtotal + service_charge_amount)
+    gst_amount = _round2(taxable_amount * gst_percent / 100.0)
+    grand_total = _round2(taxable_amount + gst_amount)
+
+    return {
+        "ok": True,
+        "order_id": snap.get("order_id"),
+        "currency": snap.get("currency") or "USD",
+        "items": out_items,
+        "subtotal": subtotal,
+        "service_charge_percent": service_charge_percent,
+        "service_charge_amount": service_charge_amount,
+        "gst_percent": gst_percent,
+        "gst_amount": gst_amount,
+        "grand_total": grand_total,
     }
 
 
@@ -260,6 +343,7 @@ def place_order(
             "created_at": now,
             "updated_at": now,
             "version": 1,
+            "proactive": _default_proactive_state(),
         }
         ins = col.insert_one(doc)
         oid = str(ins.inserted_id)
@@ -563,11 +647,15 @@ def review_and_feedback(
     billing = dict(doc.get("billing") or {})
     if bill_requested:
         billing["bill_requested_at"] = now
+    proactive = _normalize_proactive_state(doc.get("proactive"))
+    if review.get("overall_rating") is not None or (review.get("feedback_text") or "").strip():
+        proactive["rating_received_at"] = now
 
     new_version = int(doc.get("version") or 1) + 1
     set_fields: Dict[str, Any] = {
         "review": review,
         "billing": billing,
+        "proactive": proactive,
         "updated_at": now,
         "version": new_version,
     }
@@ -598,6 +686,7 @@ def review_and_feedback(
         "order_id": str(doc["_id"]),
         "review": review,
         "billing": billing,
+        "proactive": proactive,
         "message": "Saved billing / feedback on this order.",
     }
 
@@ -626,6 +715,7 @@ def bring_the_bill(order_id: Optional[str] = None) -> Dict[str, Any]:
     now = _utcnow()
     billing = dict(doc.get("billing") or {})
     billing["bill_requested_at"] = now
+    proactive = _normalize_proactive_state(doc.get("proactive"))
     new_version = int(doc.get("version") or 1) + 1
 
     col.update_one(
@@ -634,6 +724,7 @@ def bring_the_bill(order_id: Optional[str] = None) -> Dict[str, Any]:
             "$set": {
                 "bill_requested": True,
                 "billing": billing,
+                "proactive": proactive,
                 "updated_at": now,
                 "version": new_version,
             },
@@ -652,5 +743,111 @@ def bring_the_bill(order_id: Optional[str] = None) -> Dict[str, Any]:
         "order_id": str(doc["_id"]),
         "bill_requested": True,
         "billing": billing,
+        "proactive": proactive,
         "message": "Bill has been requested.",
     }
+
+
+def get_proactive_checklist(order_id: Optional[str] = None) -> Dict[str, Any]:
+    col = get_orders_collection()
+    if col is None:
+        return {"ok": False, "error": "MongoDB is not configured (set MONGODB_URI in .env)."}
+    sess = get_session()
+    if sess is None:
+        return {"ok": False, "error": "No active conversation session."}
+    doc, err = _load_order_for_session(
+        col, sess, order_id, statuses=["draft", "confirmed", "completed"]
+    )
+    if err or not doc:
+        return {"ok": False, "error": err or "Order not found."}
+    proactive = _normalize_proactive_state(doc.get("proactive"))
+    return {"ok": True, "order_id": str(doc["_id"]), "proactive": proactive}
+
+
+def update_proactive_checklist(
+    sweets_suggested: Optional[bool] = None,
+    drinks_suggested: Optional[bool] = None,
+    others_suggested: Optional[bool] = None,
+    *,
+    order_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    col = get_orders_collection()
+    if col is None:
+        return {"ok": False, "error": "MongoDB is not configured (set MONGODB_URI in .env)."}
+    sess = get_session()
+    if sess is None:
+        return {"ok": False, "error": "No active conversation session."}
+    doc, err = _load_order_for_session(
+        col, sess, order_id, statuses=["draft", "confirmed", "completed"]
+    )
+    if err or not doc:
+        return {"ok": False, "error": err or "Order not found."}
+
+    proactive = _normalize_proactive_state(doc.get("proactive"))
+    checklist = proactive["checklist"]
+    if sweets_suggested is not None:
+        checklist["sweets_suggested"] = bool(sweets_suggested)
+    if drinks_suggested is not None:
+        checklist["drinks_suggested"] = bool(drinks_suggested)
+    if others_suggested is not None:
+        checklist["others_suggested"] = bool(others_suggested)
+
+    now = _utcnow()
+    new_version = int(doc.get("version") or 1) + 1
+    col.update_one(
+        {"_id": doc["_id"]},
+        {
+            "$set": {
+                "proactive": proactive,
+                "updated_at": now,
+                "version": new_version,
+            },
+            "$push": {
+                "events": {
+                    "at": now,
+                    "type": "proactive_checklist",
+                    "detail": dict(checklist),
+                }
+            },
+        },
+    )
+    return {"ok": True, "order_id": str(doc["_id"]), "proactive": proactive}
+
+
+def mark_rating_asked(order_id: Optional[str] = None) -> Dict[str, Any]:
+    col = get_orders_collection()
+    if col is None:
+        return {"ok": False, "error": "MongoDB is not configured (set MONGODB_URI in .env)."}
+    sess = get_session()
+    if sess is None:
+        return {"ok": False, "error": "No active conversation session."}
+    doc, err = _load_order_for_session(
+        col, sess, order_id, statuses=["draft", "confirmed", "completed"]
+    )
+    if err or not doc:
+        return {"ok": False, "error": err or "Order not found."}
+
+    proactive = _normalize_proactive_state(doc.get("proactive"))
+    now = _utcnow()
+    if proactive.get("rating_asked_at") is None:
+        proactive["rating_asked_at"] = now
+
+    new_version = int(doc.get("version") or 1) + 1
+    col.update_one(
+        {"_id": doc["_id"]},
+        {
+            "$set": {
+                "proactive": proactive,
+                "updated_at": now,
+                "version": new_version,
+            },
+            "$push": {
+                "events": {
+                    "at": now,
+                    "type": "rating_asked",
+                    "detail": {"asked": True},
+                }
+            },
+        },
+    )
+    return {"ok": True, "order_id": str(doc["_id"]), "proactive": proactive}

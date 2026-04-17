@@ -3,14 +3,16 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
 from pydantic import BaseModel, Field, field_validator
 
+from app.services.blob_storage_service import upload_menu_image_bytes
 from app.services.device_auth_service import validate_device_session
 from app.services.menu_management_service import (
     _same_hotel,
     apply_availability_updates,
     fetch_menu_rows,
+    update_menu_image_url,
 )
 
 router = APIRouter()
@@ -109,3 +111,49 @@ def save_menu(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     return {"ok": True, "hotel_id": hid, "updated": updated, "failed": failed}
+
+
+@router.post("/upload_menu_image")
+async def upload_menu_image(
+    hotel_id: int = Form(...),
+    dish_id: int = Form(...),
+    image: UploadFile = File(...),
+    x_device_session: str = Header(..., alias="X-Device-Session"),
+):
+    """
+    Upload dish image to Azure Blob and update menu_items.image for (hotel_id, dish_id).
+    Requires kitchen device session and matching hotel_id.
+    """
+    sess = _require_kitchen_session(x_device_session)
+    hid = _parse_hotel_id(hotel_id)
+    if dish_id < 1:
+        raise HTTPException(status_code=400, detail="dish_id must be >= 1.")
+    if not _same_hotel(sess.get("hotel_id"), hid):
+        raise HTTPException(status_code=403, detail="Session hotel_id does not match request.")
+
+    data = await image.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty image.")
+    ctype = (image.content_type or "").lower()
+    if not ctype.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed.")
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Image too large (max 10MB).")
+
+    try:
+        blob_url = upload_menu_image_bytes(
+            data,
+            hotel_id=hid,
+            dish_id=dish_id,
+            filename=image.filename,
+            content_type=image.content_type,
+        )
+        row = update_menu_image_url(hid, dish_id, blob_url)
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="dish_id not found for this hotel.")
+    return {"ok": True, "hotel_id": hid, "item": row}

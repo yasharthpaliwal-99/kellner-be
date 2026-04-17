@@ -219,6 +219,13 @@ async def _send_show_and_structured(
     Returns parsed payload dict or None.
     """
     payload, canonical = parse_show_payload(show_text)
+    logger.warning(
+        "speak_show show_payload turn_id=%s mode=%s parsed=%s show_preview=%r",
+        turn_id,
+        mode,
+        payload is not None,
+        (show_text or "")[:280],
+    )
     if (show_text or "").strip():
         text_out = canonical if payload is not None else show_text.strip()
         await websocket.send_json({
@@ -366,6 +373,15 @@ async def _run_assistant_turn(
 
         menu_rec_count = len(menu_recommendations)
         mode = detect_response_mode(tools_used, menu_rec_count)
+        logger.warning(
+            "speak_show mode_selected turn_id=%s mode=%s tools_called=%s tools_used=%s rec_count=%s direct=%s",
+            turn_id,
+            mode,
+            tools_called,
+            tools_used,
+            menu_rec_count,
+            direct is not None,
+        )
 
         if not tools_called and filler_task and not filler_task.done():
             filler_task.cancel()
@@ -408,6 +424,13 @@ async def _run_assistant_turn(
         # Tagged reply from tool phase (rare; no format appendix was applied).
         if direct is not None:
             sp0, sh0, ok_tag_direct = parse_speak_show(direct)
+            logger.warning(
+                "speak_show direct_path turn_id=%s mode=%s tagged=%s raw_preview=%r",
+                turn_id,
+                mode,
+                ok_tag_direct,
+                (direct or "")[:280],
+            )
             if ok_tag_direct:
                 if mode != "none":
                     await websocket.send_json({
@@ -439,7 +462,7 @@ async def _run_assistant_turn(
                 return
 
         # Structured mode: raw stream so [SPEAK]/[SHOW] are not split by sentence chunking.
-        if direct is None and mode != "none":
+        if mode != "none":
             await websocket.send_json({
                 "type": "assistant_reply_mode",
                 "mode": mode,
@@ -466,6 +489,13 @@ async def _run_assistant_turn(
                 full_raw = "".join(raw_parts)
                 assistant_history_text = None
                 sp1, sh1, ok_tag = parse_speak_show(full_raw)
+                logger.warning(
+                    "speak_show structured_path turn_id=%s mode=%s tagged=%s raw_preview=%r",
+                    turn_id,
+                    mode,
+                    ok_tag,
+                    (full_raw or "")[:280],
+                )
                 if ok_tag:
                     real_output_started.set()
                     if filler_task and not filler_task.done():
@@ -484,6 +514,13 @@ async def _run_assistant_turn(
                         await _phase2_tts_from_plain(speak_line)
                     assistant_history_text = history_after_show(True, sh1, full_raw, pl_stream)
                 elif full_raw.strip() and not turn_had_error:
+                    # Fallback: model did not return tags even though a structured mode was requested.
+                    logger.warning(
+                        "speak_show fallback_to_legacy turn_id=%s mode=%s raw_preview=%r",
+                        turn_id,
+                        mode,
+                        (full_raw or "")[:280],
+                    )
                     # Fallback: legacy sentence chunks + budget TTS (same as default path).
                     real_output_started.set()
                     if filler_task and not filler_task.done():

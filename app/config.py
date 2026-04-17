@@ -77,6 +77,10 @@ class Config:
     MONGODB_URI: Optional[str] = _first_env("MONGODB_URI", "MONGO_URL")
     MONGODB_DB_NAME: str = _first_env("MONGODB_DB_NAME", "DATABASE_NAME") or "kellner"
     MONGODB_ORDERS_COLLECTION: str = _first_env("MONGODB_ORDERS_COLLECTION") or "orders"
+    BILL_SERVICE_CHARGE_PERCENT: float = float(_first_env("BILL_SERVICE_CHARGE_PERCENT") or "10")
+    BILL_GST_PERCENT: float = float(_first_env("BILL_GST_PERCENT") or "18")
+    AZURE_BLOB_CONNECTION_STRING: Optional[str] = _first_env("AZURE_BLOB_CONNECTION_STRING")
+    AZURE_BLOB_CONTAINER_NAME: str = _first_env("AZURE_BLOB_CONTAINER_NAME") or "menu-images"
 
     # Optional override for proactive `guest_greeting` WebSocket turn (empty = use per-language defaults in code).
     GUEST_GREETING_PROMPT: Optional[str] = _first_env("GUEST_GREETING_PROMPT")

@@ -37,7 +37,16 @@ def _recommendations_from_get_menu_json(result_json: str) -> List[Dict[str, Any]
                 price = float(price)
             except (TypeError, ValueError):
                 price = None
-        out.append({"name": str(name), "price": price, "info": info})
+        image = it.get("image")
+        image_url = str(image).strip() if image is not None else ""
+        out.append(
+            {
+                "name": str(name),
+                "price": price,
+                "info": info,
+                "image": image_url or None,
+            }
+        )
     return out
 
 _SYSTEM_PROMPT = """You are a professional restaurant waiter. Be warm, concise, and helpful.
@@ -46,7 +55,11 @@ _SYSTEM_PROMPT = """You are a professional restaurant waiter. Be warm, concise, 
 - When the guest confirms NEW items to add, call place_order with exact dish names from the menu (list of strings) and table_number if they gave one. Repeating a name in the same list increases quantity for that dish (e.g. two entries "Tiramisu" means two). The tool response includes order_id and line_id per line.
 - To change quantity or remove a line, use modify_order with action set_quantity or remove_item; pass line_id from the last order snapshot or dish_name matching the item. Status: draft = taking order, then confirmed, then completed — use modify_order action set_status with new_status.
 - cancel_order is still a stub if asked.
-- When the guest asks for the bill/check, call bring_the_bill (this marks bill_requested=true on the order). After that, ask one short follow-up question for feedback about the food/experience.
+- When the guest asks for the bill/check, call bring_the_bill first (marks bill_requested=true), then call get_bill_breakdown to fetch deterministic line items and totals.
+- For bill responses, never invent numbers. Use get_bill_breakdown tool values exactly (items, subtotal, service charge, GST, grand total).
+- After sharing bill info, ask one short follow-up question for feedback about the food/experience.
+- Rating persistence already uses review_and_feedback. Ask for rating once per order: check get_proactive_checklist; if rating_asked_at is missing, ask now and call mark_rating_asked.
+- For proactive flow, avoid repeating the same category suggestions. Use get_proactive_checklist before suggesting sweets/drinks/other add-ons; when you suggest one, call update_proactive_checklist with the matching flag.
 - For review_and_feedback: NEVER invent a rating or paraphrase praise. overall_rating MUST be the exact number the guest stated (1–5). feedback_text MUST be their actual words about the meal (or a faithful short quote), including complaints — do not substitute generic positive text. If they did not give a rating or comment yet, omit those fields or only set bill_requested.
 - After get_menu_items (or any recommendation flow), the guest sees full dish cards on screen (name, price, description). **Do not** describe every item or read prices aloud. Give a brief spoken reaction (~1–2 sentences, roughly **30 words or fewer** for the whole verbal part of your reply) and offer to help them choose or add to the order.
 - The full text of your reply may still be longer for on-screen reading if needed, but assume **only the first ~30 words are spoken aloud** — put the most important spoken message first, then any extra detail is display-only.
@@ -185,6 +198,97 @@ _TOOLS = [
             "description": (
                 "Mark that the guest asked for the bill/check on the active order. "
                 "Sets bill_requested=true and billing timestamp in Mongo."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "Optional Mongo order id; omit to use current session order.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_bill_breakdown",
+            "description": (
+                "Return deterministic bill fields for the active order: item lines with quantity, unit_price, line_total, "
+                "plus subtotal, service_charge_amount, gst_amount, and grand_total."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "Optional Mongo order id; omit to use current session order.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_proactive_checklist",
+            "description": (
+                "Return proactive follow-up state for the order: checklist flags (sweets/drinks/others) "
+                "and rating_asked_at/rating_received_at timestamps."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "description": "Optional Mongo order id; omit to use current session order.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_proactive_checklist",
+            "description": (
+                "Mark proactive suggestion categories as completed when they are actually suggested."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sweets_suggested": {
+                        "type": "boolean",
+                        "description": "Set true when sweets/dessert suggestion was made.",
+                    },
+                    "drinks_suggested": {
+                        "type": "boolean",
+                        "description": "Set true when drinks/beverage suggestion was made.",
+                    },
+                    "others_suggested": {
+                        "type": "boolean",
+                        "description": "Set true when other add-on/upsell suggestion was made.",
+                    },
+                    "order_id": {
+                        "type": "string",
+                        "description": "Optional Mongo order id; omit to use current session order.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mark_rating_asked",
+            "description": (
+                "Record that the rating/feedback question has already been asked for this order "
+                "so it is not repeated again."
             ),
             "parameters": {
                 "type": "object",

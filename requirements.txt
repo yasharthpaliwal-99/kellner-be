@@ -25,6 +25,9 @@ python-dotenv>=1.0.0
 # WebSocket support
 websockets>=12.0
 
+# Azure Blob (menu image upload)
+azure-storage-blob>=12.22.0
+
 # Local face embeddings (VM inference; optional — install on server only)
 insightface>=0.7.3
 onnxruntime>=1.16.0

@@ -20,8 +20,8 @@ _FORMAT_APPENDIX: dict[str, str] = {
         "For THIS reply only, return exactly two tags and nothing else (no text outside tags).\n"
         "[SPEAK] One short sentence (<=25 words) about bill/payment. [/SPEAK]\n"
         "[SHOW] A single JSON object only, no markdown code fences, matching this shape exactly:\n"
-        '{"items":[{"name":"<string>","quantity":<number>,"price":<number or null>}],"total":<number or null>}\n'
-        "Use tool results only; use null if unknown. Numbers for quantity/price/total. [/SHOW]"
+        '{"items":[{"name":"<string>","quantity":<number>,"unit_price":<number or null>,"line_total":<number or null>}],"subtotal":<number or null>,"service_charge_percent":<number or null>,"service_charge_amount":<number or null>,"gst_percent":<number or null>,"gst_amount":<number or null>,"grand_total":<number or null>,"currency":"<string or null>"}\n'
+        "Use tool results only; do not invent math. If unknown use null. [/SHOW]"
     ),
     "order_confirmation": (
         "For THIS reply only, return exactly two tags and nothing else (no text outside tags).\n"
@@ -75,7 +75,7 @@ def detect_response_mode(
     Pick at most one structured mode. Priority: bill > order_confirmation > recommendations.
     """
     s = set(tools_used or [])
-    if "bring_the_bill" in s or "review_and_feedback" in s:
+    if "bring_the_bill" in s or "get_bill_breakdown" in s or "review_and_feedback" in s:
         return "bill"
     if "get_current_order" in s or "place_order" in s or "modify_order" in s:
         return "order_confirmation"
@@ -109,7 +109,11 @@ def parse_speak_show(text: str) -> Tuple[Optional[str], Optional[str], bool]:
     if not (text or "").strip():
         return None, None, False
     sp = re.search(r"\[SPEAK\](.*?)\[/SPEAK\]", text, re.DOTALL | re.IGNORECASE)
+    # Primary shape: [SHOW] ... [/SHOW]
     sh = re.search(r"\[SHOW\](.*?)\[/SHOW\]", text, re.DOTALL | re.IGNORECASE)
+    # Tolerant fallback seen in production: model sometimes omits the closing [/SHOW].
+    if sh is None:
+        sh = re.search(r"\[SHOW\](.*)$", text, re.DOTALL | re.IGNORECASE)
     if not sp or not sh:
         return None, None, False
     spoken = (sp.group(1) or "").strip()
