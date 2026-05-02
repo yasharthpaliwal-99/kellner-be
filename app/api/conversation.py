@@ -7,7 +7,7 @@ import random
 import tempfile
 import time
 import uuid
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -208,17 +208,74 @@ async def _stream_tts_http_to_websocket(
         await worker_task
 
 
+def _normalize_dish_lookup_key(name: Any) -> str:
+    """Match LLM SHOW names to DB rows despite spacing quirks."""
+    s = str(name or "").strip().lower()
+    if not s:
+        return ""
+    return " ".join(s.split())
+
+
+def _enrich_recommendations_payload_from_tool_rows(
+    payload: dict,
+    menu_recommendations: list,
+) -> dict:
+    """Merge DB fields into SHOW items: image URL + short info (cuisine · description). Name-normalized."""
+    by_meta: dict[str, dict[str, Optional[str]]] = {}
+    for r in menu_recommendations:
+        if not isinstance(r, dict):
+            continue
+        key = _normalize_dish_lookup_key(r.get("name"))
+        if not key:
+            continue
+        img = r.get("image")
+        url = (str(img).strip() if img else None) or None
+        inf_raw = r.get("info")
+        inf = (str(inf_raw).strip() if inf_raw else None) or None
+        if key not in by_meta:
+            by_meta[key] = {"image": url, "info": inf}
+            continue
+        prev = by_meta[key]
+        if url and not prev.get("image"):
+            prev["image"] = url
+        if inf and not prev.get("info"):
+            prev["info"] = inf
+
+    items = payload.get("items")
+    if not isinstance(items, list):
+        return payload
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        key = _normalize_dish_lookup_key(it.get("name"))
+        meta = by_meta.get(key)
+        if not meta:
+            continue
+        url = meta.get("image")
+        if url:
+            it["image"] = url
+        inf = meta.get("info")
+        if inf:
+            it["info"] = inf
+    return payload
+
+
 async def _send_show_and_structured(
     websocket: WebSocket,
     mode: str,
     turn_id: int,
     show_text: str,
+    *,
+    menu_recommendations: Optional[list] = None,
 ) -> Optional[dict]:
     """
     Emit assistant_text_delta (JSON string if SHOW parses) and assistant_structured when JSON is valid.
     Returns parsed payload dict or None.
     """
     payload, canonical = parse_show_payload(show_text)
+    if payload is not None and mode == "recommendations" and menu_recommendations:
+        _enrich_recommendations_payload_from_tool_rows(payload, menu_recommendations)
+        canonical = json.dumps(payload, ensure_ascii=False)
     logger.warning(
         "speak_show show_payload turn_id=%s mode=%s parsed=%s show_preview=%r",
         turn_id,
@@ -386,12 +443,7 @@ async def _run_assistant_turn(
         if not tools_called and filler_task and not filler_task.done():
             filler_task.cancel()
 
-        if menu_recommendations:
-            await websocket.send_json({
-                "type": "recommendations",
-                "turn_id": turn_id,
-                "items": menu_recommendations,
-            })
+        # Dish cards + images: only inside Speak/Show → assistant_structured (no separate `recommendations` event).
 
         lang = (conv_session.agent_language or "en").lower()
         if lang not in ("en", "hinglish"):
@@ -444,7 +496,13 @@ async def _run_assistant_turn(
                 show_ui = (sh0 or "").strip()
                 pl_direct: Optional[dict] = None
                 if show_ui:
-                    pl_direct = await _send_show_and_structured(websocket, mode, turn_id, show_ui)
+                    pl_direct = await _send_show_and_structured(
+                        websocket,
+                        mode,
+                        turn_id,
+                        show_ui,
+                        menu_recommendations=menu_recommendations if mode == "recommendations" else None,
+                    )
                 full_segments.append(
                     json.dumps(pl_direct, ensure_ascii=False)
                     if pl_direct is not None
@@ -503,7 +561,13 @@ async def _run_assistant_turn(
                     show_ui = (sh1 or "").strip()
                     pl_stream: Optional[dict] = None
                     if show_ui:
-                        pl_stream = await _send_show_and_structured(websocket, mode, turn_id, show_ui)
+                        pl_stream = await _send_show_and_structured(
+                            websocket,
+                            mode,
+                            turn_id,
+                            show_ui,
+                            menu_recommendations=menu_recommendations if mode == "recommendations" else None,
+                        )
                     full_segments.append(
                         json.dumps(pl_stream, ensure_ascii=False)
                         if pl_stream is not None
@@ -718,7 +782,7 @@ async def ws_conversation(websocket: WebSocket):
       - Legacy: single binary WAV (RIFF…) → batch STT.
 
     Server → client:
-      transcript, recommendations (optional, after menu search), assistant_text_delta,
+      transcript, assistant_text_delta,
       assistant_reply_mode (optional: bill | order_confirmation | recommendations — sent once
       before structured assistant output for that turn), assistant_structured (optional JSON
       payload when SHOW parses), audio_delta (PCM16 mono **16 kHz** base64; chunks arrive as

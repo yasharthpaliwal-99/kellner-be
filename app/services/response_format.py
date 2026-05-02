@@ -34,9 +34,10 @@ _FORMAT_APPENDIX: dict[str, str] = {
         "For THIS reply only, return exactly two tags and nothing else (no text outside tags).\n"
         "[SPEAK] One short warm reaction (<=25 words). Do not read every dish name or price aloud. [/SPEAK]\n"
         "[SHOW] A single JSON object only, no markdown code fences, matching this shape exactly:\n"
-        '{"recommendation_focus":"<string>","items":[{"name":"<string>","quantity":<number>,"price":<number or null>}]}\n'
+        '{"recommendation_focus":"<string>","items":[{"name":"<string>","quantity":<number>,"price":<number or null>,"image":"<omit>","info":"<omit>"}]}\n'
         "recommendation_focus summarizes the guest ask (e.g. spicy, vegetarian). "
-        "Items should match the on-screen recommendation cards. Use null for unknown price. [/SHOW]"
+        "Items must match the menu search tool names/prices; omit image and info — server fills both from DB when missing. "
+        "Use null for unknown price. [/SHOW]"
     ),
 }
 
