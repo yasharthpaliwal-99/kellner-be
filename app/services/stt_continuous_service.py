@@ -3,11 +3,14 @@ Long-lived streaming STT: push PCM continuously; `recognized` fires per utteranc
 """
 from __future__ import annotations
 
+import logging
 from typing import Callable, Optional
 
 import azure.cognitiveservices.speech as speechsdk
 
 from app.config import config
+
+logger = logging.getLogger(__name__)
 
 
 class STTContinuousSession:
@@ -58,19 +61,34 @@ class STTContinuousSession:
                 self._on_partial(t)
 
     def _on_recognized(self, evt: speechsdk.SpeechRecognitionEventArgs) -> None:
-        if evt.result.reason == speechsdk.ResultReason.RecognizedSpeech:
+        reason = evt.result.reason
+        if reason == speechsdk.ResultReason.RecognizedSpeech:
             t = (evt.result.text or "").strip()
             if t and self._on_recognized_cb:
+                logger.warning("stt_recognized text_len=%s preview=%r", len(t), t[:120])
                 self._on_recognized_cb(t)
+            elif not t:
+                logger.warning("stt_recognized_empty (silence or no speech)")
+            return
+        if reason == speechsdk.ResultReason.NoMatch:
+            logger.warning("stt_no_match (no speech detected for this segment)")
+            return
+        logger.warning("stt_recognized_other reason=%s", reason)
 
     def _on_canceled(self, evt: speechsdk.SpeechRecognitionCanceledEventArgs) -> None:
-        pass
+        details = evt.cancellation_details
+        logger.warning(
+            "stt_canceled reason=%s error=%s",
+            details.reason,
+            (details.error_details or "").strip(),
+        )
 
     def start(self) -> None:
         if self._started or self._closed:
             return
         self._recognizer.start_continuous_recognition_async().get()
         self._started = True
+        logger.warning("stt_session_started region=%s", config.AZURE_SPEECH_REGION)
 
     def write(self, data: bytes) -> None:
         if data and not self._closed:
@@ -80,8 +98,9 @@ class STTContinuousSession:
         if self._closed:
             return
         self._closed = True
+        logger.warning("stt_session_closing")
         self._push.close()
         try:
             self._recognizer.stop_continuous_recognition_async().get()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stt_session_stop_failed: %s", exc)

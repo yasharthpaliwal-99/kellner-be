@@ -18,6 +18,7 @@ ResponseMode = Literal["none", "bill", "order_confirmation", "recommendations"]
 _FORMAT_APPENDIX: dict[str, str] = {
     "bill": (
         "For THIS reply only, return exactly two tags and nothing else (no text outside tags).\n"
+        "Use the literal markers [SPEAK] [/SPEAK] [SHOW] [/SHOW] — never substitute [speech text] alone instead of [SPEAK].\n"
         "[SPEAK] One short sentence (<=25 words) about bill/payment. [/SPEAK]\n"
         "[SHOW] A single JSON object only, no markdown code fences, matching this shape exactly:\n"
         '{"items":[{"name":"<string>","quantity":<number>,"unit_price":<number or null>,"line_total":<number or null>}],"subtotal":<number or null>,"service_charge_percent":<number or null>,"service_charge_amount":<number or null>,"gst_percent":<number or null>,"gst_amount":<number or null>,"grand_total":<number or null>,"currency":"<string or null>"}\n'
@@ -25,6 +26,7 @@ _FORMAT_APPENDIX: dict[str, str] = {
     ),
     "order_confirmation": (
         "For THIS reply only, return exactly two tags and nothing else (no text outside tags).\n"
+        "Use the literal markers [SPEAK] [/SPEAK] [SHOW] [/SHOW] — never substitute [speech text] alone instead of [SPEAK].\n"
         "[SPEAK] One short confirmation line (<=25 words). [/SPEAK]\n"
         "[SHOW] A single JSON object only, no markdown code fences, matching this shape exactly:\n"
         '{"items":[{"name":"<string>","quantity":<number>}]}\n'
@@ -32,6 +34,7 @@ _FORMAT_APPENDIX: dict[str, str] = {
     ),
     "recommendations": (
         "For THIS reply only, return exactly two tags and nothing else (no text outside tags).\n"
+        "Use the literal markers [SPEAK] [/SPEAK] [SHOW] [/SHOW] — never substitute [speech text] alone instead of [SPEAK].\n"
         "[SPEAK] One short warm reaction (<=25 words). Do not read every dish name or price aloud. [/SPEAK]\n"
         "[SHOW] A single JSON object only, no markdown code fences, matching this shape exactly:\n"
         '{"recommendation_focus":"<string>","items":[{"name":"<string>","quantity":<number>,"price":<number or null>,"image":"<omit>","info":"<omit>"}]}\n'
@@ -115,13 +118,32 @@ def parse_speak_show(text: str) -> Tuple[Optional[str], Optional[str], bool]:
     # Tolerant fallback seen in production: model sometimes omits the closing [/SHOW].
     if sh is None:
         sh = re.search(r"\[SHOW\](.*)$", text, re.DOTALL | re.IGNORECASE)
-    if not sp or not sh:
+
+    if not sh:
         return None, None, False
-    spoken = (sp.group(1) or "").strip()
+
     show = (sh.group(1) or "").strip()
-    if not spoken and not show:
+    if not show:
         return None, None, False
-    return spoken or None, show or None, True
+
+    if sp:
+        spoken = (sp.group(1) or "").strip()
+        if spoken:
+            return spoken, show, True
+        return None, show, True
+
+    # Models sometimes emit "[ one line of speech ]" instead of [SPEAK]...[/SPEAK] before [SHOW].
+    prefix = text[: sh.start()].strip()
+    spoken_alt = ""
+    if prefix.startswith("[") and prefix.endswith("]"):
+        spoken_alt = prefix[1:-1].strip()
+    elif prefix:
+        spoken_alt = prefix.strip()
+
+    if spoken_alt:
+        return spoken_alt, show, True
+
+    return None, show, True
 
 
 def assistant_history_content(spoken_ok: bool, show: Optional[str], full_raw: str) -> str:

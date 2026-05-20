@@ -3,6 +3,7 @@ Draft orders in MongoDB: create or append line items validated against Postgres 
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,7 +14,10 @@ from bson.errors import InvalidId
 from app.config import config
 from app.db.mongo import get_orders_collection
 from app.db.pool import get_pool
+from app.services.recommendation_service import build_order_suggestions
 from app.services.session_context import get_session
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -41,6 +45,38 @@ def _normalize_order_status(raw: Optional[str]) -> Optional[str]:
 
 def _recalc_subtotal(lines: List[Dict[str, Any]]) -> float:
     return round(sum(float(x.get("line_total") or 0) for x in lines), 2)
+
+
+def _queue_order_suggestions(
+    hotel_id: int,
+    newly_added_line_items: List[Dict[str, Any]],
+    full_line_items: List[Dict[str, Any]],
+) -> None:
+    """Push display-only pairing cards for this place_order (no-op if none)."""
+    sess = get_session()
+    if sess is None:
+        logger.warning("order_suggestions: no conversation session")
+        return
+    try:
+        new_ids = [int(li["dish_id"]) for li in newly_added_line_items]
+        payload = build_order_suggestions(hotel_id, new_ids, full_line_items)
+        if payload:
+            sess.pending_order_suggestions.append(payload)
+            logger.info(
+                "order_suggestions queued hotel_id=%s trigger_dish_ids=%s item_count=%s",
+                hotel_id,
+                new_ids,
+                len(payload.get("items") or []),
+            )
+        else:
+            logger.info(
+                "order_suggestions empty hotel_id=%s trigger_dish_ids=%s "
+                "(check menu_items.best_pair_with INTEGER[] and course_type)",
+                hotel_id,
+                new_ids,
+            )
+    except Exception as exc:
+        logger.warning("order_suggestions failed: %s", exc, exc_info=True)
 
 
 def _round2(v: float) -> float:
@@ -348,6 +384,7 @@ def place_order(
         ins = col.insert_one(doc)
         oid = str(ins.inserted_id)
         sess.order_id = oid
+        _queue_order_suggestions(hotel_id, line_items, line_items)
         return {
             "ok": True,
             "order_id": oid,
@@ -399,6 +436,7 @@ def place_order(
     )
     oid = str(existing["_id"])
     sess.order_id = oid
+    _queue_order_suggestions(hotel_id, line_items, merged)
     return {
         "ok": True,
         "order_id": oid,

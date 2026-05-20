@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -14,6 +14,8 @@ class ConversationSession:
     order_id: Optional[str] = None  # Mongo ObjectId hex string after first place_order
     # Mongo `hotels` doc: agent_language | … → "en" | "hinglish" (legacy hi/hindi → hinglish)
     agent_language: str = "en"
+    # Filled by place_order; flushed over WS before "done" (same object — safe across threads).
+    pending_order_suggestions: List[Dict[str, Any]] = field(default_factory=list)
 
 
 _session_var: ContextVar[Optional[ConversationSession]] = ContextVar(

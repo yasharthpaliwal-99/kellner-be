@@ -49,7 +49,9 @@ def _recommendations_from_get_menu_json(result_json: str) -> List[Dict[str, Any]
         )
     return out
 
-_SYSTEM_PROMPT = """You are a professional restaurant waiter. Be warm, concise, and helpful.
+_SYSTEM_PROMPT = """You are a professional restaurant waiter at a dine-in restaurant (not a hotel). Be warm, concise, and helpful.
+- Do not mention room service, hotel stays, or front-desk services. Help with the menu, ordering, bill, and table requests only.
+- Do not ask for the guest's name, age, or other personal details. If the guest volunteers a name you may use it naturally; never prompt for name or age.
 - Use tools to fetch real menu data before answering menu questions.
 - Before adding items, call get_current_order if unsure what is already on the ticket. Do NOT call place_order again for a dish that is already on the order unless the guest clearly asks to add more (e.g. "another", "one more", "add a second", "extra portion"). If they only mention a dish again in passing (e.g. "I love the tiramisu") without asking to add more, acknowledge it — do not place_order.
 - When the guest confirms NEW items to add, call place_order with exact dish names from the menu (list of strings) and table_number if they gave one. Repeating a name in the same list increases quantity for that dish (e.g. two entries "Tiramisu" means two). The tool response includes order_id and line_id per line.
@@ -64,7 +66,7 @@ _SYSTEM_PROMPT = """You are a professional restaurant waiter. Be warm, concise, 
 - After get_menu_items (or any recommendation flow), the guest sees full dish cards on screen (name, price, description). **Do not** describe every item or read prices aloud. Give a brief spoken reaction (~1–2 sentences, roughly **30 words or fewer** for the whole verbal part of your reply) and offer to help them choose or add to the order.
 - The full text of your reply may still be longer for on-screen reading if needed, but assume **only the first ~30 words are spoken aloud** — put the most important spoken message first, then any extra detail is display-only.
 - No markdown or bullet lists in replies; plain sentences.
-- The "Guest profile" paragraph below (if present) is the source of truth. If it already includes a name, greet by name and do not ask for name or age again. If it includes an age, do not ask for age unless the guest wants to correct it. Only when that paragraph says name is not set yet (or no guest profile line exists), ask for name and age and then call update_guest_profile. Until name is saved in that case, avoid placing food orders unless the guest insists on ordering without sharing."""
+- If the Guest profile below includes a name, you may greet them by name once; never ask for name or age."""
 
 _TOOLS = [
     {
@@ -361,27 +363,6 @@ _TOOLS = [
                     "order_id": {"type": "string"},
                 },
                 "required": ["order_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "update_guest_profile",
-            "description": (
-                "Save the guest's name and age after they explicitly provide them. "
-                "Use only when name is not already in the Guest profile or they are correcting it."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Guest's name as they gave it."},
-                    "age": {
-                        "type": "integer",
-                        "description": "Guest's age as an integer if they gave it; omit if unknown.",
-                    },
-                },
-                "required": ["name"],
             },
         },
     },
@@ -702,12 +683,12 @@ class LLMService:
             ag = p.get("age")
             if not nm_stripped:
                 profile_text = (
-                    "\n\nGuest profile — name not set yet (face enroll). Ask for name and age, "
-                    "then call update_guest_profile."
+                    "\n\nGuest profile — returning guest (face recognized). Do not ask for name or age. "
+                    "Focus on menu and ordering."
                 )
             else:
                 profile_text = (
-                    f"\n\nGuest profile — name: {nm_stripped}, age: {ag}, "
+                    f"\n\nGuest profile — name: {nm_stripped} (use for greeting only; do not ask for age). "
                     f"dietary: {p.get('dietary_preferences')}, "
                     f"allergens: {p.get('allergens')}, "
                     f"favourite dishes: {p.get('favorite_dishes')}, "
@@ -716,8 +697,8 @@ class LLMService:
                 )
         elif cid <= 0:
             profile_text = (
-                "\n\n**Guest identity:** No customer profile is linked to this session (anonymous). "
-                "Do not greet by name or assume a returning guest until they identify or enroll."
+                "\n\n**Guest identity:** Anonymous table session. Do not ask for name or age. "
+                "Help with menu, ordering, and bill only."
             )
 
         lines = []

@@ -70,13 +70,15 @@ logger = logging.getLogger(__name__)
 
 # Synthetic user message for LLM on `guest_greeting` (Call waiter / proactive welcome). Not shown as user text when source=guest_greeting.
 _GUEST_GREETING_EN = (
-    "The guest has just started a voice session. Greet them warmly in one or two short sentences, "
-    "introduce yourself as the hotel assistant, and offer help with the menu, ordering, or room service. "
+    "The guest has just started a voice session at the restaurant table. Greet them warmly in one or two short sentences, "
+    "introduce yourself as their table waiter, and offer help with the menu or placing an order. "
+    "Do not mention room service or hotel. Do not ask for their name or age. "
     "Do not ask them to repeat anything; keep it natural and welcoming."
 )
 _GUEST_GREETING_HINGLISH = (
-    "Guest abhi voice session shuru kiya hai. Unhe warmly greet karo — ek ya do short sentences mein, "
-    "khud ko hotel assistant batao, aur menu, order ya room service mein help offer karo. "
+    "Guest abhi table par voice session shuru kiya hai. Unhe warmly greet karo — ek ya do short sentences mein, "
+    "khud ko table waiter batao, aur menu dekhne ya order karne mein help offer karo. "
+    "Room service ya hotel ki baat mat karo. Naam ya umar mat puchho. "
     "Natural Indian Hinglish mein bolo. Kuch repeat karne ko mat kaho."
 )
 
@@ -98,48 +100,12 @@ streaming_tts = StreamingTTSService()
 
 # Holding phrases while tools + LLM run (not added to history). Picked by hotel `agent_language`.
 FILLERS_EN = [
-    "Alright, I got this.",
-    "Let me check that for you.",
-    "One moment, please.",
-    "Sure, checking now.",
-    "I am on it.",
-    "Got it, give me a second.",
-    "Let me verify that.",
-    "Thanks, checking this now.",
-    "Okay, I am checking.",
-    "Let me quickly confirm that.",
-    "Just a second.",
-    "Working on that now.",
-    "Bear with me for a moment.",
-    "I will look that up right away.",
-    "Give me just a moment.",
-    "Checking the details for you.",
-    "Almost there.",
-    "Let me pull that up.",
-    "One sec while I check.",
-    "On it — one moment.",
+    "One minute, sir.",
+    "I will check.",
 ]
 FILLERS_HINGLISH = [
-    "Thik hai, abhi check kar raha hoon.",
-    "Ek second, dekh raha hoon.",
-    "Sure, abhi verify kar leta hoon.",
-    "Haanji, menu dekh raha hoon.",
-    "Theek hai, ruko zara.",
-    "Samajh gaya, abhi dekhta hoon.",
-    "Just a moment, check kar raha hoon.",
-    "Ji, abhi confirm karta hoon.",
-    "Ek minute, details nikal raha hoon.",
-    "Bilkul, abhi dekh leta hoon.",
-    "On it — thoda wait kariye.",
-    "Haan, abhi check karta hoon.",
-    "Ruko, abhi pata karta hoon.",
-    "Theek, abhi dekh raha hoon aapke liye.",
-    "Sure, ek second.",
-    "Abhi pull kar raha hoon.",
-    "Thik, verify ho raha hai.",
-    "Bas, almost ho gaya check.",
-    "Ji haan, dekh raha hoon.",
-    "Theek hai, ek pal.",
+    "Ek minute.",
+    "Main check karta hu.",
 ]
 
 
@@ -155,6 +121,15 @@ async def _send_pcm_audio_deltas(websocket: WebSocket, pcm: bytes, turn_id: int)
 
 
 _TTS_STREAM_END = object()
+
+
+def _drain_async_queue(q: asyncio.Queue) -> None:
+    """Unblock producers waiting on Queue.put when the consumer exits early (bounded queue)."""
+    while True:
+        try:
+            q.get_nowait()
+        except asyncio.QueueEmpty:
+            break
 
 
 async def _stream_tts_http_to_websocket(
@@ -300,6 +275,44 @@ async def _send_show_and_structured(
     return payload
 
 
+async def _emit_pending_order_suggestions(
+    websocket: WebSocket,
+    turn_id: int,
+    conv_session: ConversationSession,
+) -> None:
+    """Display-only pairing cards after place_order (no TTS)."""
+    payloads = list(conv_session.pending_order_suggestions)
+    conv_session.pending_order_suggestions.clear()
+    for payload in payloads:
+        logger.info(
+            "order_suggestions ws turn_id=%s order_id=%s items=%s",
+            turn_id,
+            conv_session.order_id,
+            len(payload.get("items") or []),
+        )
+        await websocket.send_json({
+            "type": "order_suggestions",
+            "turn_id": turn_id,
+            "order_id": conv_session.order_id,
+            "payload": payload,
+        })
+
+
+async def _finish_turn_for_client(
+    websocket: WebSocket,
+    turn_id: int,
+    conv_session: ConversationSession,
+) -> None:
+    """Unlock the table UI before TTS (order_suggestions + done)."""
+    await _emit_pending_order_suggestions(websocket, turn_id, conv_session)
+    await _send_turn_done(websocket, turn_id)
+
+
+async def _send_turn_done(websocket: WebSocket, turn_id: int) -> None:
+    logger.warning("turn_done turn_id=%s", turn_id)
+    await websocket.send_json({"type": "done", "turn_id": turn_id})
+
+
 def _log_assistant_task(task: asyncio.Task) -> None:
     if not task.done() or task.cancelled():
         return
@@ -400,6 +413,7 @@ async def _run_assistant_turn(
     try:
         # ContextVar must stay set through resolve_tools + streaming LLM so tools/profile stay correct.
         ctx_token = attach_session(conv_session)
+        conv_session.pending_order_suggestions.clear()
         tr0 = time.perf_counter()
         context = retrieval_service.retrieve(transcript)
         retrieval_seconds = time.perf_counter() - tr0
@@ -473,6 +487,22 @@ async def _run_assistant_turn(
             if first_audio_ref[0] is not None:
                 first_audio_seconds = first_audio_ref[0] - t_turn_start
 
+        def _schedule_tts_after_done(speak_line: str) -> None:
+            text = (speak_line or "").strip()
+            if not text or turn_had_error:
+                return
+
+            async def _run_tts() -> None:
+                try:
+                    await _phase2_tts_from_plain(text)
+                except asyncio.CancelledError:
+                    streaming_tts.stop()
+                    raise
+                except Exception as exc:
+                    logger.warning("tts_after_done_failed turn_id=%s: %s", turn_id, exc)
+
+            asyncio.create_task(_run_tts())
+
         # Tagged reply from tool phase (rare; no format appendix was applied).
         if direct is not None:
             sp0, sh0, ok_tag_direct = parse_speak_show(direct)
@@ -509,14 +539,13 @@ async def _run_assistant_turn(
                     else (show_ui or direct.strip())
                 )
                 speak_line = (sp0 or "").strip()
-                if speak_line:
-                    await _phase2_tts_from_plain(speak_line)
                 assistant_history_text = history_after_show(True, sh0, direct, pl_direct)
                 history.append({"role": "user", "content": user_history_stub})
                 history.append({"role": "assistant", "content": assistant_history_text})
                 if len(history) > 20:
                     history = history[-20:]
-                await websocket.send_json({"type": "done", "turn_id": turn_id})
+                await _finish_turn_for_client(websocket, turn_id, conv_session)
+                _schedule_tts_after_done(speak_line)
                 return
 
         # Structured mode: raw stream so [SPEAK]/[SHOW] are not split by sentence chunking.
@@ -528,6 +557,7 @@ async def _run_assistant_turn(
             })
             msgs_tagged = append_format_instruction(messages, mode)
             raw_parts: list[str] = []
+            speak_for_tts: Optional[str] = None
             try:
                 t_raw_stream = time.perf_counter()
                 async for delta in llm_service.astream_raw_text_after_tools(
@@ -573,9 +603,7 @@ async def _run_assistant_turn(
                         if pl_stream is not None
                         else (show_ui or full_raw.strip())
                     )
-                    speak_line = (sp1 or "").strip()
-                    if speak_line and not turn_had_error:
-                        await _phase2_tts_from_plain(speak_line)
+                    speak_for_tts = (sp1 or "").strip() or None
                     assistant_history_text = history_after_show(True, sh1, full_raw, pl_stream)
                 elif full_raw.strip() and not turn_had_error:
                     # Fallback: model did not return tags even though a structured mode was requested.
@@ -600,7 +628,7 @@ async def _run_assistant_turn(
                             "turn_id": turn_id,
                         })
                     if full_segments:
-                        await _phase2_tts_from_plain(" ".join(full_segments))
+                        speak_for_tts = " ".join(full_segments)
                     assistant_history_text = assistant_history_content(False, None, full_raw)
                 if assistant_history_text and not turn_had_error:
                     history.append({"role": "user", "content": user_history_stub})
@@ -609,7 +637,9 @@ async def _run_assistant_turn(
                         history = history[-20:]
             if filler_task and not filler_task.done():
                 filler_task.cancel()
-            await websocket.send_json({"type": "done", "turn_id": turn_id})
+            await _finish_turn_for_client(websocket, turn_id, conv_session)
+            if speak_for_tts:
+                _schedule_tts_after_done(speak_for_tts)
             return
 
         text_q: asyncio.Queue = asyncio.Queue()
@@ -684,17 +714,15 @@ async def _run_assistant_turn(
             if filler_task and not filler_task.done():
                 filler_task.cancel()
 
-        # Phase 2: TTS — one synthesis of the first complete sentences within the word budget.
-        if not turn_had_error and full_segments:
-            await _phase2_tts_from_plain(" ".join(full_segments))
-
         if full_segments:
             history.append({"role": "user", "content": user_history_stub})
             history.append({"role": "assistant", "content": " ".join(full_segments)})
             if len(history) > 20:
                 history = history[-20:]
 
-        await websocket.send_json({"type": "done", "turn_id": turn_id})
+        await _finish_turn_for_client(websocket, turn_id, conv_session)
+        if not turn_had_error and full_segments:
+            _schedule_tts_after_done(" ".join(full_segments))
     finally:
         if ctx_token is not None:
             reset_session(ctx_token)
@@ -836,6 +864,7 @@ async def ws_conversation(websocket: WebSocket):
 
     def schedule_utterance(text: str) -> None:
         if not (text or "").strip():
+            logger.warning("stt_recognized_skipped (empty text)")
             return
 
         async def _go() -> None:
@@ -843,6 +872,11 @@ async def ws_conversation(websocket: WebSocket):
             await cancel_assistant()
             turn_seq += 1
             tid = turn_seq
+            logger.warning(
+                "assistant_turn_start turn_id=%s transcript_preview=%r",
+                tid,
+                (text or "")[:120],
+            )
             assistant_task = asyncio.create_task(
                 _run_assistant_turn(
                     websocket,
@@ -857,10 +891,24 @@ async def ws_conversation(websocket: WebSocket):
 
         asyncio.run_coroutine_threadsafe(_go(), loop)
 
+    logger.warning(
+        "ws_session_open session_id=%s hotel_id=%s",
+        conv_session.session_id,
+        conv_session.hotel_id,
+    )
+
     try:
         while True:
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
+                code = msg.get("code")
+                reason = msg.get("reason") or ""
+                logger.warning(
+                    "ws_disconnect_message session_id=%s code=%s reason=%r",
+                    conv_session.session_id,
+                    code,
+                    reason,
+                )
                 break
 
             if msg.get("text"):
@@ -891,6 +939,7 @@ async def ws_conversation(websocket: WebSocket):
                     assistant_task.add_done_callback(_log_assistant_task)
                     continue
                 if data.get("type") == "voice_session":
+                    logger.warning("ws_voice_session_control session_id=%s", conv_session.session_id)
                     if stt is None:
                         stt = STTContinuousSession(
                             on_partial=lambda t: asyncio.run_coroutine_threadsafe(
@@ -925,11 +974,21 @@ async def ws_conversation(websocket: WebSocket):
                     await asyncio.to_thread(stt.start)
                 stt.write(b)
 
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
+    except WebSocketDisconnect as exc:
+        logger.warning(
+            "ws_disconnected session_id=%s code=%s",
+            conv_session.session_id,
+            getattr(exc, "code", None),
+        )
+    except Exception as exc:
+        logger.exception("ws_conversation_error session_id=%s: %s", conv_session.session_id, exc)
     finally:
+        logger.warning(
+            "ws_session_ended session_id=%s last_turn_seq=%s stt_was_active=%s",
+            conv_session.session_id,
+            turn_seq,
+            stt is not None and not getattr(stt, "_closed", True),
+        )
         await cancel_assistant()
         if stt is not None:
             stt.close()

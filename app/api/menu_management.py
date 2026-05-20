@@ -66,16 +66,19 @@ class SaveMenuRequest(BaseModel):
 @router.post("/fetch_menu")
 def fetch_menu(
     payload: FetchMenuRequest,
-    x_device_session: str = Header(..., alias="X-Device-Session"),
+    x_device_session: Optional[str] = Header(None, alias="X-Device-Session"),
 ):
     """
-    Returns all menu rows for the hotel: dish_id, name, price, available.
-    Requires a valid **kitchen** device session; session hotel must match payload hotel_id.
+    Returns all menu rows for the hotel: dish_id, name, price, available, image.
+    Works without auth (conversation page) or with a kitchen session (kitchen dashboard).
+    When a kitchen session is provided, hotel_id must match.
     """
-    sess = _require_kitchen_session(x_device_session)
     hid = _parse_hotel_id(payload.hotel_id)
-    if not _same_hotel(sess.get("hotel_id"), hid):
-        raise HTTPException(status_code=403, detail="Session hotel_id does not match request.")
+    sid = (x_device_session or "").strip()
+    if sid:
+        sess = _require_kitchen_session(x_device_session)
+        if not _same_hotel(sess.get("hotel_id"), hid):
+            raise HTTPException(status_code=403, detail="Session hotel_id does not match request.")
     try:
         items = fetch_menu_rows(hid)
     except ValueError as e:
