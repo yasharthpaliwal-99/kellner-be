@@ -11,6 +11,10 @@ Voice-based restaurant assistant: Azure Speech (STT/TTS), Azure OpenAI, PostgreS
 5. Run: `uvicorn app.main:app --reload`
 6. Open `http://127.0.0.1:8000` — use **Start voice chat** for continuous voice.
 
+## Production (Azure VM)
+
+See **[docs/VM_DEPLOYMENT.md](docs/VM_DEPLOYMENT.md)** for nginx, systemd, deploy pipeline, API URLs, and troubleshooting.
+
 ## Scripts
 
 | Script | Purpose |

@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS menu_items (
     description   TEXT,
     allergens     TEXT[],
     available     BOOLEAN DEFAULT true,
+    chef_special  BOOLEAN NOT NULL DEFAULT false,
+    todays_special BOOLEAN NOT NULL DEFAULT false,
+    must_try      BOOLEAN NOT NULL DEFAULT false,
     date_created  TIMESTAMP DEFAULT NOW()
 );
 """

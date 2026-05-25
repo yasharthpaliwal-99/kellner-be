@@ -63,7 +63,7 @@ class ToolExecutor:
                         FROM menu_items
                         WHERE available = true AND hotel_id = %s
                         ORDER BY embedding <=> %s::vector
-                        LIMIT 6
+                        LIMIT 9
                         """,
                         (sess.hotel_id, query_vector),
                     )
@@ -74,7 +74,7 @@ class ToolExecutor:
                         FROM menu_items
                         WHERE available = true
                         ORDER BY embedding <=> %s::vector
-                        LIMIT 6
+                        LIMIT 9
                         """,
                         (query_vector,),
                     )

@@ -27,6 +27,7 @@ from app.services.response_format import (
 from app.services.retrieval_service import RetrievalService
 from app.services.stt_continuous_service import STTContinuousSession
 from app.services.stt_service import STTService
+from app.services.order_service import get_proactive_checklist, mark_rating_asked
 from app.services.session_context import ConversationSession, attach_session, reset_session
 from app.services.tts_streaming_service import StreamingTTSService
 
@@ -108,6 +109,14 @@ FILLERS_HINGLISH = [
     "Main check karta hu.",
 ]
 
+# Spoken once per order after bill (deterministic; OpenAI TTS HTTP stream, not Speech SDK).
+_POST_BILL_FEEDBACK_EN = (
+    "How was everything? If you have a moment, a quick rating from one to five would mean a lot."
+)
+_POST_BILL_FEEDBACK_HINGLISH = (
+    "Sab kaisa laga? Agar ho sake toh one se five rating de dijiye, bahut help hogi."
+)
+
 
 async def _send_pcm_audio_deltas(websocket: WebSocket, pcm: bytes, turn_id: int) -> None:
     chunk_size = 4096
@@ -181,6 +190,64 @@ async def _stream_tts_http_to_websocket(
             await _send_pcm_audio_deltas(websocket, item, turn_id)
     finally:
         await worker_task
+
+
+def _post_bill_feedback_line(agent_language: str) -> str:
+    lang = (agent_language or "en").lower()
+    if lang == "hinglish":
+        return _POST_BILL_FEEDBACK_HINGLISH
+    return _POST_BILL_FEEDBACK_EN
+
+
+async def _speak_post_bill_feedback_if_needed(
+    websocket: WebSocket,
+    turn_id: int,
+    conv_session: ConversationSession,
+) -> None:
+    """After bill TTS: one fixed feedback prompt if rating not asked yet; marks rating_asked."""
+    lang = (conv_session.agent_language or "en").lower()
+    if lang not in ("en", "hinglish"):
+        lang = "en"
+    line = _post_bill_feedback_line(lang)
+
+    def _should_ask_and_mark() -> bool:
+        snap = get_proactive_checklist(order_id=conv_session.order_id)
+        if not snap.get("ok"):
+            return False
+        proactive = snap.get("proactive") or {}
+        if proactive.get("rating_asked_at"):
+            return False
+        marked = mark_rating_asked(order_id=conv_session.order_id)
+        return bool(marked.get("ok"))
+
+    try:
+        should_speak = await asyncio.to_thread(_should_ask_and_mark)
+    except Exception as exc:
+        logger.warning("post_bill_feedback_check_failed turn_id=%s: %s", turn_id, exc)
+        return
+    if not should_speak:
+        return
+
+    logger.warning("post_bill_feedback_spoken turn_id=%s", turn_id)
+    await websocket.send_json({
+        "type": "assistant_text_delta",
+        "text": line,
+        "turn_id": turn_id,
+    })
+    try:
+        await _stream_tts_http_to_websocket(
+            websocket,
+            turn_id,
+            line,
+            agent_language=lang,
+            is_filler=False,
+            tts=streaming_tts,
+        )
+    except asyncio.CancelledError:
+        streaming_tts.stop()
+        raise
+    except Exception as exc:
+        logger.warning("post_bill_feedback_tts_failed turn_id=%s: %s", turn_id, exc)
 
 
 def _normalize_dish_lookup_key(name: Any) -> str:
@@ -487,14 +554,25 @@ async def _run_assistant_turn(
             if first_audio_ref[0] is not None:
                 first_audio_seconds = first_audio_ref[0] - t_turn_start
 
-        def _schedule_tts_after_done(speak_line: str) -> None:
+        def _schedule_tts_after_done(
+            speak_line: str,
+            *,
+            post_bill_feedback: bool = False,
+        ) -> None:
             text = (speak_line or "").strip()
-            if not text or turn_had_error:
+            if turn_had_error:
+                return
+            if not text and not post_bill_feedback:
                 return
 
             async def _run_tts() -> None:
                 try:
-                    await _phase2_tts_from_plain(text)
+                    if text:
+                        await _phase2_tts_from_plain(text)
+                    if post_bill_feedback:
+                        await _speak_post_bill_feedback_if_needed(
+                            websocket, turn_id, conv_session
+                        )
                 except asyncio.CancelledError:
                     streaming_tts.stop()
                     raise
@@ -545,7 +623,10 @@ async def _run_assistant_turn(
                 if len(history) > 20:
                     history = history[-20:]
                 await _finish_turn_for_client(websocket, turn_id, conv_session)
-                _schedule_tts_after_done(speak_line)
+                _schedule_tts_after_done(
+                    speak_line,
+                    post_bill_feedback=(mode == "bill"),
+                )
                 return
 
         # Structured mode: raw stream so [SPEAK]/[SHOW] are not split by sentence chunking.
@@ -638,8 +719,11 @@ async def _run_assistant_turn(
             if filler_task and not filler_task.done():
                 filler_task.cancel()
             await _finish_turn_for_client(websocket, turn_id, conv_session)
-            if speak_for_tts:
-                _schedule_tts_after_done(speak_for_tts)
+            if speak_for_tts or mode == "bill":
+                _schedule_tts_after_done(
+                    speak_for_tts or "",
+                    post_bill_feedback=(mode == "bill"),
+                )
             return
 
         text_q: asyncio.Queue = asyncio.Queue()

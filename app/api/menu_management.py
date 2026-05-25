@@ -3,15 +3,17 @@ from __future__ import annotations
 
 from typing import Any, List, Optional
 
-from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field, field_validator
 
 from app.services.blob_storage_service import upload_menu_image_bytes
 from app.services.device_auth_service import validate_device_session
 from app.services.menu_management_service import (
+    MenuItemUpdate,
     _same_hotel,
-    apply_availability_updates,
+    apply_menu_item_updates,
     fetch_menu_rows,
+    fetch_spotlight_rails,
     update_menu_image_url,
 )
 
@@ -49,6 +51,9 @@ class FetchMenuRequest(BaseModel):
 class SaveMenuItem(BaseModel):
     dish_id: int = Field(..., ge=1)
     available: bool
+    chef_special: bool = False
+    todays_special: bool = False
+    must_try: bool = False
 
 
 class SaveMenuRequest(BaseModel):
@@ -69,7 +74,8 @@ def fetch_menu(
     x_device_session: Optional[str] = Header(None, alias="X-Device-Session"),
 ):
     """
-    Returns all menu rows for the hotel: dish_id, name, price, available, image.
+    Returns all menu rows for the hotel: dish_id, name, price, available, image,
+    chef_special, todays_special, must_try.
     Works without auth (conversation page) or with a kitchen session (kitchen dashboard).
     When a kitchen session is provided, hotel_id must match.
     """
@@ -88,13 +94,27 @@ def fetch_menu(
     return {"ok": True, "hotel_id": hid, "items": items}
 
 
+@router.get("/menu/spotlights")
+def get_menu_spotlights(hotel_id: int = Query(..., ge=1)):
+    """
+    Guest home screen: Chef's Special, Today's Special, Must Try (available dishes only).
+    """
+    try:
+        rails = fetch_spotlight_rails(hotel_id)
+    except ValueError as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    return {"ok": True, "hotel_id": hotel_id, "rails": rails}
+
+
 @router.post("/save_menu")
 def save_menu(
     payload: SaveMenuRequest,
     x_device_session: str = Header(..., alias="X-Device-Session"),
 ):
     """
-    Updates `available` only for listed dishes. Requires **kitchen** session; hotel must match.
+    Updates availability and spotlight flags for listed dishes. Requires **kitchen** session.
     Unknown dish_id or wrong hotel → listed in `failed`, not a hard error unless all fail.
     """
     sess = _require_kitchen_session(x_device_session)
@@ -105,9 +125,18 @@ def save_menu(
     if not payload.items:
         return {"ok": True, "hotel_id": hid, "updated": [], "failed": []}
 
-    updates = [(it.dish_id, it.available) for it in payload.items]
+    updates = [
+        MenuItemUpdate(
+            dish_id=it.dish_id,
+            available=it.available,
+            chef_special=it.chef_special,
+            todays_special=it.todays_special,
+            must_try=it.must_try,
+        )
+        for it in payload.items
+    ]
     try:
-        updated, failed = apply_availability_updates(hid, updates)
+        updated, failed = apply_menu_item_updates(hid, updates)
     except ValueError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     except Exception as e:

@@ -96,7 +96,7 @@ _TOOLS = [
             "description": (
                 "Semantically search the menu for dishes relevant to the guest's request. "
                 "Pass the guest's query as-is — e.g. 'spicy vegetarian mains', 'light dessert', "
-                "'something with chicken'. Returns the 6 most relevant available dishes."
+                "'something with chicken'. Returns the 9 most relevant available dishes."
             ),
             "parameters": {
                 "type": "object",

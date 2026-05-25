@@ -1,0 +1,22 @@
+[Unit]
+Description=Kellner FastAPI (gunicorn + uvicorn workers)
+After=network.target
+
+[Service]
+Type=simple
+User=kellner-admin
+Group=kellner-admin
+WorkingDirectory=/opt/kellner
+EnvironmentFile=/opt/kellner/.env
+# Stop any manual `uvicorn` in SSH before enabling this service (same port).
+ExecStart=/opt/kellner/.venv/bin/gunicorn app.main:app \
+  -k uvicorn.workers.UvicornWorker \
+  -w 1 \
+  --bind 127.0.0.1:8000 \
+  --timeout 120 \
+  --graceful-timeout 30
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
