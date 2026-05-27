@@ -54,7 +54,7 @@ def test_openai_tts() -> bool:
 
 
 def test_openai() -> bool:
-    from openai import OpenAI
+    from openai import AzureOpenAI
     from app.config import config
 
     if not config.AZURE_OPENAI_ENDPOINT or not config.AZURE_OPENAI_API_KEY:
@@ -65,14 +65,17 @@ def test_openai() -> bool:
         return True
 
     try:
-        client = OpenAI(
-            base_url=config.AZURE_OPENAI_ENDPOINT,
+        from app.services.llm_service import completion_limit_kwargs
+
+        client = AzureOpenAI(
+            azure_endpoint=config.AZURE_OPENAI_ENDPOINT,
             api_key=config.AZURE_OPENAI_API_KEY,
+            api_version=config.AZURE_OPENAI_API_VERSION,
         )
         response = client.chat.completions.create(
             model=config.AZURE_OPENAI_DEPLOYMENT_NAME,
             messages=[{"role": "user", "content": "Reply with exactly: OK"}],
-            max_tokens=10,
+            **completion_limit_kwargs(10),
         )
         reply = response.choices[0].message.content or ""
         print(f"OK   Azure OpenAI — reply: {reply.strip()!r}")

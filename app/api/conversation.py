@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any, List, Optional
@@ -151,7 +152,7 @@ async def _stream_tts_http_to_websocket(
     tts: StreamingTTSService,
     first_audio_perf: Optional[list] = None,
     cancel_if_event: Optional[asyncio.Event] = None,
-) -> None:
+) -> int:
     """Read TTS HTTP body in a worker thread; forward 16 kHz PCM to WebSocket as it arrives."""
     text = (text or "").strip()
     if not text:
@@ -175,6 +176,7 @@ async def _stream_tts_http_to_websocket(
                 pass
 
     worker_task = asyncio.create_task(asyncio.to_thread(worker))
+    total_pcm_bytes = 0
     try:
         while True:
             item = await q.get()
@@ -187,9 +189,11 @@ async def _stream_tts_http_to_websocket(
                 break
             if first_audio_perf is not None and first_audio_perf[0] is None:
                 first_audio_perf[0] = time.perf_counter()
+            total_pcm_bytes += len(item)
             await _send_pcm_audio_deltas(websocket, item, turn_id)
     finally:
         await worker_task
+    return total_pcm_bytes
 
 
 def _post_bill_feedback_line(agent_language: str) -> str:
@@ -399,6 +403,7 @@ async def _run_assistant_turn(
     enable_filler: bool = True,
     *,
     stt_seconds: Optional[float] = None,
+    stt_audio_bytes: Optional[int] = None,
     proactive_source: Optional[str] = None,
 ) -> None:
     if not transcript.strip():
@@ -410,6 +415,14 @@ async def _run_assistant_turn(
     transaction_id = str(uuid.uuid4())
     t_turn_start = time.perf_counter()
     timing_events: List[dict] = []
+    if stt_audio_bytes is not None:
+        timing_events.append(
+            {
+                "event": "stt_usage",
+                "audio_bytes": int(stt_audio_bytes),
+                "approx_audio_seconds": round(float(stt_audio_bytes) / 32000.0, 4),
+            }
+        )
     full_segments: list[str] = []
     retrieval_seconds: Optional[float] = None
     llm_tools_wall_seconds: Optional[float] = None
@@ -458,7 +471,7 @@ async def _run_assistant_turn(
                     "turn_id": turn_id,
                 })
 
-                await _stream_tts_http_to_websocket(
+                pcm_bytes = await _stream_tts_http_to_websocket(
                     websocket,
                     turn_id,
                     phrase,
@@ -466,6 +479,15 @@ async def _run_assistant_turn(
                     is_filler=True,
                     tts=streaming_tts,
                     cancel_if_event=real_output_started,
+                )
+                timing_events.append(
+                    {
+                        "event": "tts_usage",
+                        "scope": "filler",
+                        "input_chars": len(phrase),
+                        "pcm_bytes": pcm_bytes,
+                        "approx_audio_seconds": round(pcm_bytes / 32000.0, 4),
+                    }
                 )
 
             except asyncio.CancelledError:
@@ -541,7 +563,7 @@ async def _run_assistant_turn(
                 return
             tt0 = time.perf_counter()
             first_audio_ref: list = [None]
-            await _stream_tts_http_to_websocket(
+            pcm_bytes = await _stream_tts_http_to_websocket(
                 websocket,
                 turn_id,
                 spoken,
@@ -553,6 +575,15 @@ async def _run_assistant_turn(
             tts_seconds = time.perf_counter() - tt0
             if first_audio_ref[0] is not None:
                 first_audio_seconds = first_audio_ref[0] - t_turn_start
+            timing_events.append(
+                {
+                    "event": "tts_usage",
+                    "scope": "main",
+                    "input_chars": len(spoken),
+                    "pcm_bytes": pcm_bytes,
+                    "approx_audio_seconds": round(pcm_bytes / 32000.0, 4),
+                }
+            )
 
         def _schedule_tts_after_done(
             speak_line: str,
@@ -812,6 +843,26 @@ async def _run_assistant_turn(
             reset_session(ctx_token)
         turn_total_seconds = time.perf_counter() - t_turn_start
         assistant_text = " ".join(full_segments)
+        llm_prompt_tokens = 0
+        llm_completion_tokens = 0
+        for ev in timing_events:
+            if not isinstance(ev, dict):
+                continue
+            if str(ev.get("event", "")).startswith("llm_"):
+                try:
+                    llm_prompt_tokens += int(ev.get("prompt_tokens") or 0)
+                    llm_completion_tokens += int(ev.get("completion_tokens") or 0)
+                except (TypeError, ValueError):
+                    continue
+        if llm_prompt_tokens or llm_completion_tokens:
+            timing_events.append(
+                {
+                    "event": "llm_usage_summary",
+                    "prompt_tokens": llm_prompt_tokens,
+                    "completion_tokens": llm_completion_tokens,
+                    "total_tokens": llm_prompt_tokens + llm_completion_tokens,
+                }
+            )
         row = {
             "transaction_id": transaction_id,
             "session_id": conv_session.session_id,
@@ -881,6 +932,7 @@ async def _batch_wav_turn(
         conv_session,
         enable_filler=False,
         stt_seconds=stt_s,
+        stt_audio_bytes=len(audio_data),
     )
 
 
@@ -933,6 +985,9 @@ async def ws_conversation(websocket: WebSocket):
     turn_seq = 0
     assistant_task: Optional[asyncio.Task] = None
     stt: Optional[STTContinuousSession] = None
+    stt_total_audio_bytes = 0
+    stt_last_turn_byte_mark = 0
+    stt_bytes_lock = threading.Lock()
     loop = asyncio.get_running_loop()
 
     async def cancel_assistant() -> None:
@@ -947,9 +1002,13 @@ async def ws_conversation(websocket: WebSocket):
         assistant_task = None
 
     def schedule_utterance(text: str) -> None:
+        nonlocal stt_last_turn_byte_mark
         if not (text or "").strip():
             logger.warning("stt_recognized_skipped (empty text)")
             return
+        with stt_bytes_lock:
+            turn_audio_bytes = max(0, stt_total_audio_bytes - stt_last_turn_byte_mark)
+            stt_last_turn_byte_mark = stt_total_audio_bytes
 
         async def _go() -> None:
             nonlocal assistant_task, turn_seq
@@ -969,6 +1028,7 @@ async def ws_conversation(websocket: WebSocket):
                     tid,
                     conv_session,
                     enable_filler=True,
+                    stt_audio_bytes=turn_audio_bytes,
                 )
             )
             assistant_task.add_done_callback(_log_assistant_task)
@@ -1056,6 +1116,8 @@ async def ws_conversation(websocket: WebSocket):
                         on_recognized=schedule_utterance,
                     )
                     await asyncio.to_thread(stt.start)
+                with stt_bytes_lock:
+                    stt_total_audio_bytes += len(b)
                 stt.write(b)
 
     except WebSocketDisconnect as exc:

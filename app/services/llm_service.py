@@ -5,8 +5,63 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
 from openai import AsyncAzureOpenAI, AzureOpenAI
 
 from app.config import config
+from app.services.response_format import detect_response_mode, parse_speak_show
 from app.services.session_context import get_session
 from app.services.tool_executor import ToolExecutor
+
+# Tool rounds only choose/execute tools — keep completions tiny to avoid slow prose.
+TOOL_ROUND_MAX_TOKENS = 128
+# GPT-5 models spend completion budget on internal reasoning tokens before tool/text output.
+GPT5_TOOL_ROUND_MAX_TOKENS = 512
+# [SPEAK]+[SHOW] JSON fits in ~120–180 tokens; avoids 400-token menu essays after tools.
+FORMAT_STREAM_MAX_TOKENS = 180
+GPT5_FORMAT_STREAM_MAX_TOKENS = 400
+# Legacy plain stream when mode=none but tools ran (no structured tags).
+PLAIN_STREAM_MAX_TOKENS = 200
+GPT5_PLAIN_STREAM_MAX_TOKENS = 400
+
+
+def _deployment_name_lower() -> str:
+    return (config.AZURE_OPENAI_DEPLOYMENT_NAME or "").lower()
+
+
+def completion_limit_kwargs(limit: int) -> Dict[str, int]:
+    """GPT-5 deployments use max_completion_tokens; gpt-4o and older use max_tokens."""
+    if _deployment_name_lower().startswith("gpt-5"):
+        return {"max_completion_tokens": limit}
+    return {"max_tokens": limit}
+
+
+def chat_temperature_kwargs(temperature: float) -> Dict[str, float]:
+    """GPT-5 chat only supports the default temperature; omit the parameter."""
+    if _deployment_name_lower().startswith("gpt-5"):
+        return {}
+    return {"temperature": temperature}
+
+
+def gpt5_model_kwargs() -> Dict[str, Any]:
+    """Extra chat params for GPT-5 deployments (reasoning budget + minimal reasoning effort)."""
+    if not _deployment_name_lower().startswith("gpt-5"):
+        return {}
+    return {"reasoning_effort": "minimal"}
+
+
+def tool_round_limit() -> int:
+    if _deployment_name_lower().startswith("gpt-5"):
+        return GPT5_TOOL_ROUND_MAX_TOKENS
+    return TOOL_ROUND_MAX_TOKENS
+
+
+def format_stream_limit() -> int:
+    if _deployment_name_lower().startswith("gpt-5"):
+        return GPT5_FORMAT_STREAM_MAX_TOKENS
+    return FORMAT_STREAM_MAX_TOKENS
+
+
+def plain_stream_limit() -> int:
+    if _deployment_name_lower().startswith("gpt-5"):
+        return GPT5_PLAIN_STREAM_MAX_TOKENS
+    return PLAIN_STREAM_MAX_TOKENS
 
 
 def _recommendations_from_get_menu_json(result_json: str) -> List[Dict[str, Any]]:
@@ -458,15 +513,37 @@ class LLMService:
                 messages=messages,
                 tools=_TOOLS,
                 tool_choice="auto",
-                max_tokens=400,
-                temperature=0.2,
+                **chat_temperature_kwargs(0.2),
+                **gpt5_model_kwargs(),
+                **completion_limit_kwargs(tool_round_limit()),
             )
             llm_dt = time.perf_counter() - t
             print(f"  [LLM] call #{call_num} (tools): {llm_dt:.2f}s")
             msg = response.choices[0].message
             if not msg.tool_calls:
                 answer = (msg.content or "").strip()
-                print(f"  [LLM] no tool calls — direct ({len(answer)} chars)")
+                usage = getattr(response, "usage", None)
+                in_tok = getattr(usage, "prompt_tokens", None) if usage else None
+                out_tok = getattr(usage, "completion_tokens", None) if usage else None
+                total_tok = getattr(usage, "total_tokens", None) if usage else None
+                if tools_called:
+                    mode = detect_response_mode(tools_used, len(menu_recommendations))
+                    if mode != "none":
+                        _, _, ok_tag = parse_speak_show(answer)
+                        if ok_tag:
+                            print(
+                                f"  [LLM] tools done — tagged direct ({len(answer)} chars)"
+                            )
+                        else:
+                            print(
+                                f"  [LLM] tools done — defer format stream"
+                                f" (mode={mode}, skipped {len(answer)} char prose)"
+                            )
+                            answer = None
+                    else:
+                        print(f"  [LLM] no tool calls — direct ({len(answer)} chars)")
+                else:
+                    print(f"  [LLM] no tool calls — direct ({len(answer)} chars)")
                 if timing_events is not None:
                     timing_events.append(
                         {
@@ -474,13 +551,23 @@ class LLMService:
                             "call": call_num,
                             "seconds": round(llm_dt, 4),
                             "has_tool_calls": False,
-                            "answer_chars": len(answer),
+                            "answer_chars": len(answer or ""),
+                            "prompt_tokens": in_tok,
+                            "completion_tokens": out_tok,
+                            "total_tokens": total_tok,
+                            "deferred_format_stream": tools_called
+                            and answer is None
+                            and detect_response_mode(
+                                tools_used, len(menu_recommendations)
+                            )
+                            != "none",
                         }
                     )
                 return messages, answer if answer else None, menu_recommendations, tools_called, tools_used
             tool_names = [tc.function.name for tc in msg.tool_calls]
             print(f"  [LLM] tool calls: {tool_names}")
             if timing_events is not None:
+                usage = getattr(response, "usage", None)
                 timing_events.append(
                     {
                         "event": "llm_tools_call",
@@ -488,6 +575,9 @@ class LLMService:
                         "seconds": round(llm_dt, 4),
                         "has_tool_calls": True,
                         "tools": tool_names,
+                        "prompt_tokens": getattr(usage, "prompt_tokens", None) if usage else None,
+                        "completion_tokens": getattr(usage, "completion_tokens", None) if usage else None,
+                        "total_tokens": getattr(usage, "total_tokens", None) if usage else None,
                     }
                 )
             if not tools_called:
@@ -521,6 +611,23 @@ class LLMService:
                     "content": result,
                 })
 
+            # Menu search is one-shot; skip the slow post-tool prose call entirely.
+            if detect_response_mode(tools_used, len(menu_recommendations)) == "recommendations":
+                print(
+                    "  [LLM] tools done — skip prose call; "
+                    "format stream next (mode=recommendations)"
+                )
+                if timing_events is not None:
+                    timing_events.append(
+                        {
+                            "event": "tools_phase_complete",
+                            "mode": "recommendations",
+                            "tools": list(tools_used),
+                            "deferred_format_stream": True,
+                        }
+                    )
+                return messages, None, menu_recommendations, tools_called, tools_used
+
     async def astream_tts_segments_after_tools(
         self,
         messages: list,
@@ -549,16 +656,21 @@ class LLMService:
             return
 
         t = time.perf_counter()
+        stream_usage = None
         stream = await self._aclient.chat.completions.create(
             model=config.AZURE_OPENAI_DEPLOYMENT_NAME,
             messages=messages,
-            max_tokens=400,
-            temperature=0.7,
             stream=True,
+            stream_options={"include_usage": True},
+            **chat_temperature_kwargs(0.7),
+            **gpt5_model_kwargs(),
+            **completion_limit_kwargs(plain_stream_limit()),
         )
         first = True
         buffer = ""
         async for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                stream_usage = chunk.usage
             if first:
                 first_dt = time.perf_counter() - t
                 print(f"  [LLM] stream (response) first chunk: {first_dt:.2f}s")
@@ -588,6 +700,9 @@ class LLMService:
                     "event": "llm_stream",
                     "mode": "stream",
                     "seconds": round(time.perf_counter() - t, 4),
+                    "prompt_tokens": getattr(stream_usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(stream_usage, "completion_tokens", None),
+                    "total_tokens": getattr(stream_usage, "total_tokens", None),
                 }
             )
 
@@ -596,6 +711,8 @@ class LLMService:
         messages: list,
         direct_answer: Optional[str],
         timing_events: Optional[List[Dict[str, Any]]] = None,
+        *,
+        max_tokens: Optional[int] = None,
     ) -> AsyncIterator[str]:
         """
         Second LLM phase without sentence splitting — raw delta.content chunks only.
@@ -615,20 +732,27 @@ class LLMService:
                 )
             return
 
+        limit = max_tokens if max_tokens is not None else format_stream_limit()
         t = time.perf_counter()
+        print(f"  [LLM] stream (raw format) max_tokens={limit}")
+        stream_usage = None
         stream = await self._aclient.chat.completions.create(
             model=config.AZURE_OPENAI_DEPLOYMENT_NAME,
             messages=messages,
-            max_tokens=400,
-            temperature=0.7,
             stream=True,
+            stream_options={"include_usage": True},
+            **chat_temperature_kwargs(0.2),
+            **gpt5_model_kwargs(),
+            **completion_limit_kwargs(limit),
         )
         first = True
         n_chunks = 0
         async for chunk in stream:
+            if getattr(chunk, "usage", None) is not None:
+                stream_usage = chunk.usage
             if first:
                 first_dt = time.perf_counter() - t
-                print(f"  [LLM] stream (raw) first chunk: {first_dt:.2f}s")
+                print(f"  [LLM] stream (raw format) first chunk: {first_dt:.2f}s")
                 if timing_events is not None:
                     timing_events.append(
                         {
@@ -651,6 +775,9 @@ class LLMService:
                     "mode": "raw",
                     "seconds": round(time.perf_counter() - t, 4),
                     "chunks_yielded": n_chunks,
+                    "prompt_tokens": getattr(stream_usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(stream_usage, "completion_tokens", None),
+                    "total_tokens": getattr(stream_usage, "total_tokens", None),
                 }
             )
 
